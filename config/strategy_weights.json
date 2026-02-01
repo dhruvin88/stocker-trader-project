@@ -1,0 +1,41 @@
+{
+  "strategies": {
+    "rsi": {
+      "weight": 0.25,
+      "enabled": true,
+      "min_weight": 0.1,
+      "max_weight": 0.4
+    },
+    "macd": {
+      "weight": 0.25,
+      "enabled": true,
+      "min_weight": 0.1,
+      "max_weight": 0.4
+    },
+    "ma_crossover": {
+      "weight": 0.25,
+      "enabled": true,
+      "min_weight": 0.1,
+      "max_weight": 0.4
+    },
+    "momentum": {
+      "weight": 0.25,
+      "enabled": true,
+      "min_weight": 0.1,
+      "max_weight": 0.4
+    }
+  },
+  "voting": {
+    "threshold": 0.6,
+    "conflict_resolution": "weighted_average",
+    "min_strategies_agree": 2
+  },
+  "auto_adjust": {
+    "enabled": true,
+    "adjustment_frequency": "weekly",
+    "performance_window_trades": 20,
+    "min_win_rate": 0.4,
+    "weight_increase_step": 0.05,
+    "weight_decrease_step": 0.05
+  }
+}
