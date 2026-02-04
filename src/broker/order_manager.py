@@ -9,6 +9,7 @@ from src.storage.database import get_database, Trade
 from src.utils.logger import get_logger, trade_logger
 from src.utils.notifications import notifications
 from config.settings import settings
+from datetime import date
 
 logger = get_logger(__name__)
 
@@ -38,9 +39,18 @@ class OrderResult:
 class OrderManager:
     """Manages order execution with limit orders and fallback logic."""
 
-    def __init__(self, client: Optional[AlpacaClient] = None):
+    def __init__(self, client: Optional[AlpacaClient] = None, wash_sale_tracker=None):
         self.client = client or get_alpaca_client()
         self.db = get_database()
+        self._wash_sale_tracker = wash_sale_tracker
+
+    @property
+    def wash_sale_tracker(self):
+        """Lazy load wash sale tracker to avoid circular imports."""
+        if self._wash_sale_tracker is None:
+            from src.broker.wash_sale_tracker import WashSaleTracker
+            self._wash_sale_tracker = WashSaleTracker()
+        return self._wash_sale_tracker
 
     def execute_entry(
         self,
@@ -68,8 +78,23 @@ class OrderManager:
             quote = self.client.get_quote(symbol)
             limit_price = self._calculate_limit_price(quote, side)
 
+            # Recalculate stop loss and take profit based on actual execution price
+            # This handles cases where signal prices are stale
+            if stop_loss and take_profit:
+                if direction == "long":
+                    # For long positions: stop below entry, take profit above
+                    adj_stop_loss = round(limit_price * (1 - settings.DEFAULT_STOP_LOSS), 2)
+                    adj_take_profit = round(limit_price * (1 + settings.DEFAULT_TAKE_PROFIT), 2)
+                else:
+                    # For short positions: stop above entry, take profit below
+                    adj_stop_loss = round(limit_price * (1 + settings.DEFAULT_STOP_LOSS), 2)
+                    adj_take_profit = round(limit_price * (1 - settings.DEFAULT_TAKE_PROFIT), 2)
+                stop_loss = adj_stop_loss
+                take_profit = adj_take_profit
+
             logger.info(
-                f"Executing {direction} entry: {quantity} {symbol} @ ${limit_price:.2f}"
+                f"Executing {direction} entry: {quantity} {symbol} @ ${limit_price:.2f} "
+                f"(SL: ${stop_loss:.2f}, TP: ${take_profit:.2f})"
             )
 
             if stop_loss and take_profit:
@@ -163,6 +188,15 @@ class OrderManager:
         try:
             position = self.client.get_position(symbol)
             if position is None:
+                # Position doesn't exist at broker - clean up local DB if present
+                # This can happen when bracket orders execute stop/take-profit
+                db_position = self.db.get_position(symbol)
+                if db_position:
+                    logger.warning(
+                        f"Position {symbol} not found at broker but exists in local DB. "
+                        f"Cleaning up stale position (likely closed by bracket order)."
+                    )
+                    self.db.remove_position(symbol)
                 return OrderResult(
                     success=False,
                     order_id=None,
@@ -218,6 +252,15 @@ class OrderManager:
 
                 if exit_qty >= abs(position.qty):
                     self.db.remove_position(symbol)
+
+                # Record wash sale if sold at a loss
+                if pnl < 0 and settings.WASH_SALE_ENABLED:
+                    self.wash_sale_tracker.record_loss_sale(
+                        symbol=symbol,
+                        exit_date=date.today(),
+                        loss_amount=abs(pnl),
+                        exit_price=result.filled_price
+                    )
 
                 trade_logger.info(
                     f"EXIT: {exit_qty} {symbol} @ ${result.filled_price:.2f} | "
