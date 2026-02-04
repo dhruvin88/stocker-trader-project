@@ -20,6 +20,7 @@ from src.storage.database import get_database
 from src.broker.alpaca_client import get_alpaca_client
 from src.broker.order_manager import OrderManager
 from src.broker.pdt_tracker import PDTTracker
+from src.broker.wash_sale_tracker import WashSaleTracker
 from src.risk.position_sizer import PositionSizer
 from src.risk.stop_manager import StopManager
 from src.strategies.technical.rsi_strategy import RSIStrategy
@@ -34,7 +35,8 @@ class TradingBot:
         self.running = False
         self.client = get_alpaca_client()
         self.db = get_database()
-        self.order_manager = OrderManager(self.client)
+        self.wash_sale_tracker = WashSaleTracker()
+        self.order_manager = OrderManager(self.client, self.wash_sale_tracker)
         self.pdt_tracker = PDTTracker(self.client)
         self.position_sizer = PositionSizer(self.client)
         self.stop_manager = StopManager(self.client, self.order_manager)
@@ -47,6 +49,11 @@ class TradingBot:
             "AAPL", "MSFT", "GOOGL", "AMZN", "META",
             "NVDA", "TSLA", "AMD", "NFLX", "SPY"
         ]
+
+        # Add crypto symbols if enabled
+        if settings.CRYPTO_ENABLED:
+            self.watchlist.extend(settings.CRYPTO_SYMBOLS)
+            logger.info(f"Crypto trading enabled: {settings.CRYPTO_SYMBOLS}")
 
         self._peak_portfolio_value: Optional[float] = None
         self._daily_starting_value: Optional[float] = None
@@ -128,14 +135,20 @@ class TradingBot:
             return False
 
         now = datetime.now()
+
+        # Calculate start time with proper hour overflow
+        open_total_minutes = settings.MARKET_OPEN_HOUR * 60 + settings.MARKET_OPEN_MINUTE + settings.AVOID_FIRST_MINUTES
         market_open = now.replace(
-            hour=settings.MARKET_OPEN_HOUR,
-            minute=settings.MARKET_OPEN_MINUTE + settings.AVOID_FIRST_MINUTES,
+            hour=open_total_minutes // 60,
+            minute=open_total_minutes % 60,
             second=0
         )
+
+        # Calculate close time with proper hour underflow
+        close_total_minutes = settings.MARKET_CLOSE_HOUR * 60 + settings.MARKET_CLOSE_MINUTE - settings.AVOID_LAST_MINUTES
         market_close = now.replace(
-            hour=settings.MARKET_CLOSE_HOUR,
-            minute=settings.MARKET_CLOSE_MINUTE - settings.AVOID_LAST_MINUTES,
+            hour=close_total_minutes // 60,
+            minute=close_total_minutes % 60,
             second=0
         )
 
@@ -143,7 +156,14 @@ class TradingBot:
 
     def _check_positions(self) -> None:
         """Check existing positions for stop conditions."""
-        if not self.client.is_market_open():
+        # Check if we have any crypto positions that need 24/7 monitoring
+        has_crypto_positions = any(
+            settings.is_crypto_symbol(p["symbol"])
+            for p in self.db.get_positions()
+        )
+
+        # Only skip if market closed AND no crypto positions
+        if not self.client.is_market_open() and not has_crypto_positions:
             return
 
         try:
@@ -157,8 +177,7 @@ class TradingBot:
 
     def _scan_for_signals(self) -> None:
         """Scan watchlist for trading signals."""
-        if not self._is_trading_time():
-            return
+        is_stock_trading_time = self._is_trading_time()
 
         if self._trades_today >= settings.MAX_TRADES_PER_DAY:
             logger.info("Max daily trades reached, skipping scan")
@@ -169,7 +188,18 @@ class TradingBot:
                 if not strategy.enabled:
                     continue
 
-                signals = strategy.analyze(self.watchlist)
+                # Scan stocks only during market hours, crypto 24/7
+                symbols_to_scan = []
+                for symbol in self.watchlist:
+                    if settings.is_crypto_symbol(symbol):
+                        symbols_to_scan.append(symbol)  # Crypto: always scan
+                    elif is_stock_trading_time:
+                        symbols_to_scan.append(symbol)  # Stocks: only during market hours
+
+                if not symbols_to_scan:
+                    continue
+
+                signals = strategy.analyze(symbols_to_scan)
 
                 for signal in signals:
                     if signal.is_actionable(settings.SIGNAL_THRESHOLD):
@@ -180,9 +210,12 @@ class TradingBot:
 
     def _process_signal(self, signal) -> None:
         """Process and potentially execute a trading signal."""
+        is_crypto = settings.is_crypto_symbol(signal.symbol)
+
         logger.info(
             f"Signal: {signal.direction.value.upper()} {signal.symbol} "
             f"(confidence: {signal.confidence:.2f}, strategy: {signal.strategy})"
+            f"{' [CRYPTO]' if is_crypto else ''}"
         )
 
         existing_position = self.client.get_position(signal.symbol)
@@ -190,10 +223,18 @@ class TradingBot:
             logger.info(f"Already have position in {signal.symbol}, skipping")
             return
 
-        if signal.direction.value == "long":
+        # PDT rules don't apply to crypto
+        if not is_crypto and signal.direction.value == "long":
             is_day_trade = self._would_be_day_trade(signal.symbol)
             if is_day_trade and not self.pdt_tracker.can_day_trade(signal.confidence):
                 logger.info(f"Skipping {signal.symbol} - would use day trade for low confidence signal")
+                return
+
+        # Wash sale rules don't apply to crypto
+        if not is_crypto and settings.WASH_SALE_ENABLED:
+            can_enter, reason = self.wash_sale_tracker.can_enter(signal.symbol)
+            if not can_enter:
+                logger.info(f"Skipping {signal.symbol} - {reason}")
                 return
 
         position_size = self.position_sizer.calculate_position_size(
@@ -296,12 +337,15 @@ class TradingBot:
             account = self.client.get_account()
             positions = self.client.get_positions()
             pdt_status = self.pdt_tracker.get_pdt_status()
+            wash_sale_status = self.wash_sale_tracker.get_wash_sale_status()
 
             logger.info("-" * 40)
             logger.info(f"Portfolio: ${account.portfolio_value:,.2f}")
             logger.info(f"Positions: {len(positions)}")
             logger.info(f"Day Trades Used: {pdt_status['day_trades_used']}/{settings.MAX_DAY_TRADES}")
             logger.info(f"Trades Today: {self._trades_today}")
+            if wash_sale_status['restricted_count'] > 0:
+                logger.info(f"Wash Sale Restricted: {wash_sale_status['restricted_symbols']}")
             logger.info("-" * 40)
 
         except Exception as e:

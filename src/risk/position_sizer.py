@@ -11,7 +11,7 @@ logger = get_logger(__name__)
 @dataclass
 class PositionSize:
     """Result of position sizing calculation."""
-    shares: int
+    shares: float  # Can be fractional for crypto
     position_value: float
     risk_amount: float
     risk_percent: float
@@ -82,17 +82,23 @@ class PositionSizer:
 
             risk_pct = risk_percent or self.max_risk_per_trade
 
+            # Use crypto-specific risk parameters if applicable
+            is_crypto = settings.is_crypto_symbol(symbol)
+            stop_loss_pct = settings.CRYPTO_STOP_LOSS if is_crypto else self.default_stop_loss
+            take_profit_pct = settings.CRYPTO_TAKE_PROFIT if is_crypto else self.default_take_profit
+            max_position = settings.CRYPTO_MAX_POSITION_SIZE if is_crypto else self.max_position_size
+
             if stop_loss_price is None:
                 if direction == "long":
-                    stop_loss_price = entry_price * (1 - self.default_stop_loss)
+                    stop_loss_price = entry_price * (1 - stop_loss_pct)
                 else:
-                    stop_loss_price = entry_price * (1 + self.default_stop_loss)
+                    stop_loss_price = entry_price * (1 + stop_loss_pct)
 
             if take_profit_price is None:
                 if direction == "long":
-                    take_profit_price = entry_price * (1 + self.default_take_profit)
+                    take_profit_price = entry_price * (1 + take_profit_pct)
                 else:
-                    take_profit_price = entry_price * (1 - self.default_take_profit)
+                    take_profit_price = entry_price * (1 - take_profit_pct)
 
             if direction == "long":
                 risk_per_share = entry_price - stop_loss_price
@@ -112,14 +118,20 @@ class PositionSizer:
                 )
 
             risk_amount = portfolio_value * risk_pct
-            shares_by_risk = int(risk_amount / risk_per_share)
+            shares_by_risk = risk_amount / risk_per_share
 
-            max_position_value = portfolio_value * self.max_position_size
-            shares_by_position = int(max_position_value / entry_price)
+            max_position_value = portfolio_value * max_position
+            shares_by_position = max_position_value / entry_price
 
-            shares_by_cash = int(available_cash / entry_price)
+            shares_by_cash = available_cash / entry_price
 
-            shares = min(shares_by_risk, shares_by_position, shares_by_cash)
+            shares_raw = min(shares_by_risk, shares_by_position, shares_by_cash)
+
+            # Crypto supports fractional quantities, stocks require whole shares
+            if is_crypto:
+                shares = round(shares_raw, 6)  # 6 decimal places for crypto
+            else:
+                shares = int(shares_raw)
 
             if shares <= 0:
                 return PositionSize(

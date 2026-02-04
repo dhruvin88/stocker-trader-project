@@ -32,6 +32,17 @@ class Settings:
     PDT_ROLLING_DAYS: int = 5  # Rolling window for PDT
     HIGH_CONVICTION_THRESHOLD: float = 0.8  # Reserve day trades for high scores
 
+    # Wash Sale Rule
+    WASH_SALE_ENABLED: bool = True  # Enable wash sale rule tracking
+    WASH_SALE_WINDOW_DAYS: int = 30  # Days to block re-entry after loss sale
+
+    # Crypto Trading
+    CRYPTO_ENABLED: bool = True  # Enable crypto trading (BTC/ETH)
+    CRYPTO_SYMBOLS: tuple = ("BTC/USD", "ETH/USD")  # Crypto symbols to trade
+    CRYPTO_STOP_LOSS: float = 0.04  # 4% stop loss for crypto (higher volatility)
+    CRYPTO_TAKE_PROFIT: float = 0.08  # 8% take profit for crypto
+    CRYPTO_MAX_POSITION_SIZE: float = 0.05  # 5% max position for crypto (more conservative)
+
     # Trading Hours (ET)
     MARKET_OPEN_HOUR: int = 9
     MARKET_OPEN_MINUTE: int = 30
@@ -87,6 +98,10 @@ class Settings:
     def is_paper_trading(self) -> bool:
         """Check if currently in paper trading mode."""
         return self.PAPER_TRADING or "paper" in self.ALPACA_BASE_URL.lower()
+
+    def is_crypto_symbol(self, symbol: str) -> bool:
+        """Check if a symbol is a crypto asset."""
+        return symbol in self.CRYPTO_SYMBOLS
 
     def validate(self) -> list[str]:
         """Validate settings and return list of errors."""
