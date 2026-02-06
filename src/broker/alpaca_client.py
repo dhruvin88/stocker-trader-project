@@ -4,7 +4,7 @@ from typing import Optional
 from dataclasses import dataclass
 
 import alpaca_trade_api as tradeapi
-from alpaca_trade_api.rest import APIError
+from alpaca_trade_api.rest import APIError, TimeFrame, TimeFrameUnit
 
 from config.settings import settings
 from src.utils.logger import get_logger
@@ -50,6 +50,41 @@ class Quote:
     timestamp: datetime
 
 
+def _parse_timeframe(timeframe_str: str) -> TimeFrame:
+    """Convert timeframe string to TimeFrame object.
+
+    Supported formats: '1Min', '5Min', '15Min', '1Hour', '1Day', etc.
+    """
+    timeframe_str = timeframe_str.strip()
+
+    # Handle common formats
+    if timeframe_str == "1Min" or timeframe_str == "Minute":
+        return TimeFrame.Minute
+    elif timeframe_str == "1Hour" or timeframe_str == "Hour":
+        return TimeFrame.Hour
+    elif timeframe_str == "1Day" or timeframe_str == "Day":
+        return TimeFrame.Day
+
+    # Parse numeric prefix (e.g., "15Min", "5Min")
+    import re
+    match = re.match(r'^(\d+)(Min|Hour|Day|Week|Month)$', timeframe_str)
+    if match:
+        amount = int(match.group(1))
+        unit_str = match.group(2)
+        unit_map = {
+            'Min': TimeFrameUnit.Minute,
+            'Hour': TimeFrameUnit.Hour,
+            'Day': TimeFrameUnit.Day,
+            'Week': TimeFrameUnit.Week,
+            'Month': TimeFrameUnit.Month
+        }
+        return TimeFrame(amount, unit_map[unit_str])
+
+    # Default to daily
+    logger.warning(f"Unknown timeframe format '{timeframe_str}', defaulting to Day")
+    return TimeFrame.Day
+
+
 class AlpacaClient:
     """Wrapper for the Alpaca Trading API."""
 
@@ -70,7 +105,7 @@ class AlpacaClient:
             time.sleep(self._min_request_interval - elapsed)
         self._last_request_time = time.time()
 
-    def _retry_with_backoff(self, func, max_retries: int = 3, *args, **kwargs):
+    def _retry_with_backoff(self, func, *args, max_retries: int = 3, **kwargs):
         """Execute a function with exponential backoff on failure."""
         for attempt in range(max_retries):
             try:
@@ -135,10 +170,17 @@ class AlpacaClient:
 
     def get_quote(self, symbol: str) -> Quote:
         """Get real-time quote for a symbol."""
-        snapshot = self._retry_with_backoff(
-            self.api.get_snapshot,
-            symbol
-        )
+        if settings.is_crypto_symbol(symbol):
+            snapshot = self._retry_with_backoff(
+                self.api.get_crypto_snapshot,
+                symbol
+            )
+        else:
+            snapshot = self._retry_with_backoff(
+                self.api.get_snapshot,
+                symbol,
+                feed='iex'
+            )
         quote = snapshot.latest_quote
         trade = snapshot.latest_trade
 
@@ -146,31 +188,62 @@ class AlpacaClient:
             symbol=symbol,
             bid=float(quote.bp) if quote else 0,
             ask=float(quote.ap) if quote else 0,
-            bid_size=int(quote.bs) if quote else 0,
-            ask_size=int(quote.as_) if quote else 0,
+            bid_size=int(quote.bs) if quote and hasattr(quote, 'bs') else 0,
+            ask_size=int(quote.as_) if quote and hasattr(quote, 'as_') else 0,
             last=float(trade.p) if trade else 0,
             timestamp=datetime.now()
         )
 
     def get_quotes(self, symbols: list[str]) -> dict[str, Quote]:
         """Get quotes for multiple symbols."""
-        snapshots = self._retry_with_backoff(
-            self.api.get_snapshots,
-            symbols
-        )
+        # Separate crypto and stock symbols
+        crypto_symbols = [s for s in symbols if settings.is_crypto_symbol(s)]
+        stock_symbols = [s for s in symbols if not settings.is_crypto_symbol(s)]
+
         quotes = {}
-        for symbol, snapshot in snapshots.items():
-            quote = snapshot.latest_quote
-            trade = snapshot.latest_trade
-            quotes[symbol] = Quote(
-                symbol=symbol,
-                bid=float(quote.bp) if quote else 0,
-                ask=float(quote.ap) if quote else 0,
-                bid_size=int(quote.bs) if quote else 0,
-                ask_size=int(quote.as_) if quote else 0,
-                last=float(trade.p) if trade else 0,
-                timestamp=datetime.now()
+
+        # Get stock quotes
+        if stock_symbols:
+            snapshots = self._retry_with_backoff(
+                self.api.get_snapshots,
+                stock_symbols,
+                feed='iex'
             )
+            for symbol, snapshot in snapshots.items():
+                quote = snapshot.latest_quote
+                trade = snapshot.latest_trade
+                quotes[symbol] = Quote(
+                    symbol=symbol,
+                    bid=float(quote.bp) if quote else 0,
+                    ask=float(quote.ap) if quote else 0,
+                    bid_size=int(quote.bs) if quote and hasattr(quote, 'bs') else 0,
+                    ask_size=int(quote.as_) if quote and hasattr(quote, 'as_') else 0,
+                    last=float(trade.p) if trade else 0,
+                    timestamp=datetime.now()
+                )
+
+        # Get crypto quotes
+        if crypto_symbols:
+            for symbol in crypto_symbols:
+                try:
+                    snapshot = self._retry_with_backoff(
+                        self.api.get_crypto_snapshot,
+                        symbol
+                    )
+                    quote = snapshot.latest_quote
+                    trade = snapshot.latest_trade
+                    quotes[symbol] = Quote(
+                        symbol=symbol,
+                        bid=float(quote.bp) if quote else 0,
+                        ask=float(quote.ap) if quote else 0,
+                        bid_size=int(quote.bs) if quote and hasattr(quote, 'bs') else 0,
+                        ask_size=int(quote.as_) if quote and hasattr(quote, 'as_') else 0,
+                        last=float(trade.p) if trade else 0,
+                        timestamp=datetime.now()
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to get crypto quote for {symbol}: {e}")
+
         return quotes
 
     def submit_order(
@@ -296,14 +369,32 @@ class AlpacaClient:
         if end is None:
             end = datetime.now()
 
-        bars = self._retry_with_backoff(
-            self.api.get_bars,
-            symbol,
-            timeframe,
-            start=start.isoformat(),
-            end=end.isoformat(),
-            limit=limit
-        )
+        tf = _parse_timeframe(timeframe)
+        start_str = start.strftime("%Y-%m-%d")
+        end_str = end.strftime("%Y-%m-%d")
+
+        # Use crypto endpoint for crypto symbols
+        if settings.is_crypto_symbol(symbol):
+            bars = self._retry_with_backoff(
+                lambda: self.api.get_crypto_bars(
+                    symbol,
+                    tf,
+                    start=start_str,
+                    end=end_str,
+                    limit=limit
+                )
+            )
+        else:
+            bars = self._retry_with_backoff(
+                lambda: self.api.get_bars(
+                    symbol,
+                    tf,
+                    start=start_str,
+                    end=end_str,
+                    limit=limit,
+                    feed='iex'
+                )
+            )
         return bars
 
     def get_bars_multi(
@@ -320,13 +411,18 @@ class AlpacaClient:
         if end is None:
             end = datetime.now()
 
+        tf = _parse_timeframe(timeframe)
+        start_str = start.strftime("%Y-%m-%d")
+        end_str = end.strftime("%Y-%m-%d")
         bars = self._retry_with_backoff(
-            self.api.get_bars,
-            symbols,
-            timeframe,
-            start=start.isoformat(),
-            end=end.isoformat(),
-            limit=limit
+            lambda: self.api.get_bars(
+                symbols,
+                tf,
+                start=start_str,
+                end=end_str,
+                limit=limit,
+                feed='iex'
+            )
         )
         return bars
 
