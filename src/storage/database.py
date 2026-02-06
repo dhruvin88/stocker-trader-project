@@ -159,11 +159,24 @@ class Database:
                 )
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS wash_sale_tracker (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    exit_date DATE NOT NULL,
+                    exit_price REAL NOT NULL,
+                    loss_amount REAL NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades(entry_time)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_pdt_date ON pdt_tracker(trade_date)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_wash_sale_symbol ON wash_sale_tracker(symbol)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_wash_sale_date ON wash_sale_tracker(exit_date)")
 
         logger.info(f"Database initialized at {self.db_path}")
 
@@ -307,6 +320,54 @@ class Database:
             """, (f"-{days} days",))
             rows = cursor.fetchall()
             return [date.fromisoformat(row["trade_date"]) for row in rows]
+
+    def record_wash_sale(
+        self,
+        symbol: str,
+        exit_date: date,
+        exit_price: float,
+        loss_amount: float
+    ) -> None:
+        """Record a wash sale (symbol sold at a loss)."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO wash_sale_tracker (symbol, exit_date, exit_price, loss_amount)
+                VALUES (?, ?, ?, ?)
+            """, (symbol, exit_date, exit_price, loss_amount))
+
+    def get_wash_sales_in_window(self, days: int = 30) -> list[dict]:
+        """Get all wash sales within the specified window."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM wash_sale_tracker
+                WHERE exit_date >= DATE('now', ?)
+                ORDER BY exit_date DESC
+            """, (f"-{days} days",))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    def is_symbol_in_wash_window(self, symbol: str, days: int = 30) -> bool:
+        """Check if a symbol was sold at a loss within the window."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT COUNT(*) as count FROM wash_sale_tracker
+                WHERE symbol = ? AND exit_date >= DATE('now', ?)
+            """, (symbol, f"-{days} days"))
+            row = cursor.fetchone()
+            return row["count"] > 0 if row else False
+
+    def cleanup_old_wash_sales(self, days: int = 30) -> int:
+        """Remove wash sale records older than the specified window."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                DELETE FROM wash_sale_tracker
+                WHERE exit_date < DATE('now', ?)
+            """, (f"-{days} days",))
+            return cursor.rowcount
 
     def update_daily_performance(
         self,
