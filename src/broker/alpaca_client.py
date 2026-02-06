@@ -107,16 +107,36 @@ class AlpacaClient:
 
     def _retry_with_backoff(self, func, *args, max_retries: int = 3, **kwargs):
         """Execute a function with exponential backoff on failure."""
+        last_exception = None
         for attempt in range(max_retries):
             try:
                 self._rate_limit()
                 return func(*args, **kwargs)
             except APIError as e:
+                last_exception = e
                 if attempt == max_retries - 1:
                     raise
                 wait_time = (2 ** attempt) * settings.RETRY_DELAY_SECONDS
                 logger.warning(f"API error (attempt {attempt + 1}): {e}. Retrying in {wait_time}s")
                 time.sleep(wait_time)
+            except (ConnectionError, ConnectionResetError, OSError) as e:
+                last_exception = e
+                if attempt == max_retries - 1:
+                    raise
+                wait_time = (2 ** attempt) * settings.RETRY_DELAY_SECONDS
+                logger.warning(f"Connection error (attempt {attempt + 1}): {e}. Retrying in {wait_time}s")
+                time.sleep(wait_time)
+            except Exception as e:
+                # Catch requests/urllib3 connection errors
+                if "Connection" in str(type(e).__name__) or "connection" in str(e).lower():
+                    last_exception = e
+                    if attempt == max_retries - 1:
+                        raise
+                    wait_time = (2 ** attempt) * settings.RETRY_DELAY_SECONDS
+                    logger.warning(f"Connection error (attempt {attempt + 1}): {e}. Retrying in {wait_time}s")
+                    time.sleep(wait_time)
+                else:
+                    raise
 
     def get_account(self) -> AccountInfo:
         """Get account information."""
