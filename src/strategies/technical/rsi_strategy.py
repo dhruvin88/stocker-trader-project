@@ -33,17 +33,24 @@ class RSIStrategy(BaseStrategy):
 
     def __init__(
         self,
-        rsi_period: int = 14,
-        oversold_level: int = 30,
-        overbought_level: int = 70,
+        rsi_period: int = None,
+        oversold_level: int = None,
+        overbought_level: int = None,
         ema_period: int = 21
     ):
         super().__init__()
-        self.rsi_period = rsi_period
-        self.oversold_level = oversold_level
-        self.overbought_level = overbought_level
+        # Use optimized settings from config
+        self.rsi_period = rsi_period or settings.RSI_PERIOD
+        self.oversold_level = oversold_level or settings.RSI_OVERSOLD
+        self.overbought_level = overbought_level or settings.RSI_OVERBOUGHT
         self.ema_period = ema_period
         self.client = get_alpaca_client()
+
+    def _get_rsi_thresholds(self, symbol: str) -> tuple[int, int]:
+        """Get RSI thresholds based on asset type."""
+        if settings.is_crypto_symbol(symbol):
+            return settings.RSI_CRYPTO_OVERSOLD, settings.RSI_CRYPTO_OVERBOUGHT
+        return self.oversold_level, self.overbought_level
 
     @property
     def name(self) -> str:
@@ -111,30 +118,35 @@ class RSIStrategy(BaseStrategy):
         current_rsi = entry_rsi.iloc[-1]
         current_price = float(entry_data["close"].iloc[-1])
 
+        # Get asset-specific RSI thresholds (crypto vs stocks)
+        oversold, overbought = self._get_rsi_thresholds(symbol)
+
         direction = SignalDirection.NEUTRAL
         confidence = 0.0
         metadata = {
             "rsi": round(current_rsi, 2),
             "trend": confirm_trend,
-            "rsi_period": self.rsi_period
+            "rsi_period": self.rsi_period,
+            "oversold_threshold": oversold,
+            "overbought_threshold": overbought
         }
 
-        if current_rsi < self.oversold_level and confirm_trend == "up":
+        if current_rsi < oversold and confirm_trend == "up":
             direction = SignalDirection.LONG
-            oversold_depth = (self.oversold_level - current_rsi) / self.oversold_level
+            oversold_depth = (oversold - current_rsi) / oversold
             trend_bonus = 0.2 if confirm_trend == "up" else 0
             confidence = min(0.5 + oversold_depth + trend_bonus, 0.95)
             metadata["signal_type"] = "oversold_bounce"
 
-        elif current_rsi < self.oversold_level and confirm_trend == "neutral":
+        elif current_rsi < oversold and confirm_trend == "neutral":
             direction = SignalDirection.LONG
-            oversold_depth = (self.oversold_level - current_rsi) / self.oversold_level
+            oversold_depth = (oversold - current_rsi) / oversold
             confidence = min(0.4 + oversold_depth * 0.5, 0.7)
             metadata["signal_type"] = "oversold_neutral_trend"
 
-        elif current_rsi > self.overbought_level:
+        elif current_rsi > overbought:
             direction = SignalDirection.SHORT
-            overbought_depth = (current_rsi - self.overbought_level) / (100 - self.overbought_level)
+            overbought_depth = (current_rsi - overbought) / (100 - overbought)
             trend_bonus = 0.2 if confirm_trend == "down" else 0
             confidence = min(0.5 + overbought_depth + trend_bonus, 0.95)
             metadata["signal_type"] = "overbought_reversal"
@@ -174,10 +186,13 @@ class RSIStrategy(BaseStrategy):
         if last_signal is None:
             return False, ""
 
-        if last_signal.direction == SignalDirection.LONG and current_rsi > self.overbought_level:
+        # Get asset-specific RSI thresholds
+        oversold, overbought = self._get_rsi_thresholds(symbol)
+
+        if last_signal.direction == SignalDirection.LONG and current_rsi > overbought:
             return True, f"RSI overbought ({current_rsi:.1f})"
 
-        if last_signal.direction == SignalDirection.SHORT and current_rsi < self.oversold_level:
+        if last_signal.direction == SignalDirection.SHORT and current_rsi < oversold:
             return True, f"RSI oversold ({current_rsi:.1f})"
 
         return False, ""

@@ -36,11 +36,11 @@ class Settings:
     WASH_SALE_ENABLED: bool = True  # Enable wash sale rule tracking
     WASH_SALE_WINDOW_DAYS: int = 30  # Days to block re-entry after loss sale
 
-    # Crypto Trading
+    # Crypto Trading (Optimized via backtest)
     CRYPTO_ENABLED: bool = True  # Enable crypto trading (BTC/ETH)
     CRYPTO_SYMBOLS: tuple = ("BTC/USD", "ETH/USD")  # Crypto symbols to trade
-    CRYPTO_STOP_LOSS: float = 0.04  # 4% stop loss for crypto (higher volatility)
-    CRYPTO_TAKE_PROFIT: float = 0.08  # 8% take profit for crypto
+    CRYPTO_STOP_LOSS: float = 0.05  # 5% stop loss (optimized from 4%)
+    CRYPTO_TAKE_PROFIT: float = 0.06  # 6% take profit (optimized from 8%)
     CRYPTO_MAX_POSITION_SIZE: float = 0.05  # 5% max position for crypto (more conservative)
 
     # Trading Hours (ET)
@@ -65,15 +65,22 @@ class Settings:
     GRADUAL_REENTRY_START: float = 0.25  # Start weight for re-enabled strategies
     SIGNAL_THRESHOLD: float = 0.6  # Minimum score to execute trade
 
+    # RSI Strategy (Optimized via backtest)
+    RSI_PERIOD: int = 14  # RSI calculation period
+    RSI_OVERSOLD: int = 35  # Entry threshold (optimized from 30)
+    RSI_OVERBOUGHT: int = 65  # Exit threshold (optimized from 70)
+    RSI_CRYPTO_OVERSOLD: int = 30  # Crypto entry threshold (wider range)
+    RSI_CRYPTO_OVERBOUGHT: int = 70  # Crypto exit threshold
+
     # Order Settings
     ORDER_TIMEOUT_SECONDS: int = 60  # Timeout for limit orders
     LIMIT_ORDER_OFFSET: float = 0.001  # 0.1% offset from current price
     MAX_RETRIES: int = 3  # Max retries for failed orders
     RETRY_DELAY_SECONDS: int = 5  # Delay between retries
 
-    # Exit Rules
-    DEFAULT_STOP_LOSS: float = 0.02  # 2% default stop loss
-    DEFAULT_TAKE_PROFIT: float = 0.04  # 4% default take profit
+    # Exit Rules (Optimized via backtest)
+    DEFAULT_STOP_LOSS: float = 0.025  # 2.5% stop loss (optimized from 2%)
+    DEFAULT_TAKE_PROFIT: float = 0.04  # 4% take profit
     TRAILING_STOP_ACTIVATION: float = 0.02  # Activate trailing at 2% profit
     TRAILING_STOP_DISTANCE: float = 0.01  # 1% trailing distance
 
