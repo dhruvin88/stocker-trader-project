@@ -97,7 +97,10 @@ class OrderManager:
                 f"(SL: ${stop_loss:.2f}, TP: ${take_profit:.2f})"
             )
 
-            if stop_loss and take_profit:
+            # Crypto doesn't support bracket orders, use simple limit orders
+            is_crypto = settings.is_crypto_symbol(symbol)
+
+            if stop_loss and take_profit and not is_crypto:
                 order = self.client.submit_bracket_order(
                     symbol=symbol,
                     qty=quantity,
@@ -107,12 +110,15 @@ class OrderManager:
                     stop_loss_price=stop_loss
                 )
             else:
+                # Simple limit order (crypto or no stops)
+                # For crypto, time_in_force must be 'gtc' (good til cancelled)
                 order = self.client.submit_order(
                     symbol=symbol,
                     qty=quantity,
                     side=side,
                     order_type="limit",
-                    limit_price=limit_price
+                    limit_price=limit_price,
+                    time_in_force="gtc" if is_crypto else "day"
                 )
 
             result = self._wait_for_fill(order.id, settings.ORDER_TIMEOUT_SECONDS)
@@ -325,7 +331,7 @@ class OrderManager:
                         success=True,
                         order_id=order_id,
                         status=OrderStatus.FILLED,
-                        filled_qty=int(order.filled_qty),
+                        filled_qty=float(order.filled_qty),  # Use float for crypto support
                         filled_price=float(order.filled_avg_price),
                         message="Order filled"
                     )
@@ -341,7 +347,7 @@ class OrderManager:
                         success=False,
                         order_id=order_id,
                         status=OrderStatus(order.status),
-                        filled_qty=int(order.filled_qty) if order.filled_qty else 0,
+                        filled_qty=float(order.filled_qty) if order.filled_qty else 0,
                         filled_price=float(order.filled_avg_price) if order.filled_avg_price else None,
                         message=f"Order {order.status}"
                     )
@@ -357,12 +363,12 @@ class OrderManager:
 
         try:
             order = self.client.get_order(order_id)
-            if int(order.filled_qty) > 0:
+            if float(order.filled_qty) > 0:
                 return OrderResult(
                     success=True,
                     order_id=order_id,
                     status=OrderStatus.PARTIALLY_FILLED,
-                    filled_qty=int(order.filled_qty),
+                    filled_qty=float(order.filled_qty),
                     filled_price=float(order.filled_avg_price),
                     message="Order partially filled before timeout"
                 )

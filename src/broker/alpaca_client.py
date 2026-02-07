@@ -199,23 +199,20 @@ class AlpacaClient:
     def get_quote(self, symbol: str) -> Quote:
         """Get real-time quote for a symbol."""
         if settings.is_crypto_symbol(symbol):
-            # Crypto snapshot returns dict keyed by symbol
+            # Crypto snapshot returns SnapshotsV2 dict keyed by symbol
             snapshots = self._retry_with_backoff(
                 self.api.get_crypto_snapshot,
                 symbol
             )
-            # Handle both dict and direct snapshot response
-            if isinstance(snapshots, dict):
-                snapshot = snapshots.get(symbol)
-            else:
-                snapshot = snapshots
+            # Access the snapshot for this symbol
+            snapshot = snapshots[symbol] if symbol in snapshots else None
 
             if snapshot is None:
                 return Quote(symbol=symbol, bid=0, ask=0, bid_size=0,
                            ask_size=0, last=0, timestamp=datetime.now())
 
-            quote = getattr(snapshot, 'latest_quote', None)
-            trade = getattr(snapshot, 'latest_trade', None)
+            quote = snapshot.latest_quote
+            trade = snapshot.latest_trade
         else:
             snapshot = self._retry_with_backoff(
                 self.api.get_snapshot,
