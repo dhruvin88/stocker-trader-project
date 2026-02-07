@@ -25,7 +25,6 @@ from src.risk.position_sizer import PositionSizer
 from src.risk.stop_manager import StopManager
 from src.strategies.technical.rsi_strategy import RSIStrategy
 from src.strategies.technical.momentum_breakout_strategy import MomentumBreakoutStrategy
-from src.strategies.technical.vwap_bounce_strategy import VWAPBounceStrategy
 
 logger = get_logger(__name__)
 
@@ -44,9 +43,8 @@ class TradingBot:
         self.stop_manager = StopManager(self.client, self.order_manager)
 
         self.strategies = [
-            MomentumBreakoutStrategy(),  # Aggressive momentum breakouts
-            VWAPBounceStrategy(),         # Aggressive VWAP bounce/rejection
-            RSIStrategy()                 # Original RSI mean reversion
+            MomentumBreakoutStrategy(),  # Primary: 239 trades/year, +$1,766 in backtest
+            RSIStrategy()                 # Backup: Mean reversion on extreme RSI
         ]
 
         self.watchlist = [
