@@ -172,10 +172,14 @@ class AlpacaClient:
     def get_position(self, symbol: str) -> Optional[Position]:
         """Get position for a specific symbol."""
         try:
-            p = self._retry_with_backoff(self.api.get_position, symbol)
+            # Alpaca uses ETHUSD format for crypto positions, not ETH/USD
+            api_symbol = symbol.replace("/", "") if settings.is_crypto_symbol(symbol) else symbol
+            # Don't use retry for position check - "not found" is expected
+            self._rate_limit()
+            p = self.api.get_position(api_symbol)
             return Position(
-                symbol=p.symbol,
-                qty=int(p.qty),
+                symbol=symbol,  # Return original format
+                qty=int(float(p.qty)),  # Crypto can have fractional qty
                 avg_entry_price=float(p.avg_entry_price),
                 current_price=float(p.current_price),
                 market_value=float(p.market_value),
@@ -184,25 +188,42 @@ class AlpacaClient:
                 side=p.side
             )
         except APIError as e:
-            if "position does not exist" in str(e).lower():
+            if "position does not exist" in str(e).lower() or "404" in str(e):
+                return None
+            raise
+        except Exception as e:
+            if "404" in str(e) or "not found" in str(e).lower() or "position does not exist" in str(e).lower():
                 return None
             raise
 
     def get_quote(self, symbol: str) -> Quote:
         """Get real-time quote for a symbol."""
         if settings.is_crypto_symbol(symbol):
-            snapshot = self._retry_with_backoff(
+            # Crypto snapshot returns dict keyed by symbol
+            snapshots = self._retry_with_backoff(
                 self.api.get_crypto_snapshot,
                 symbol
             )
+            # Handle both dict and direct snapshot response
+            if isinstance(snapshots, dict):
+                snapshot = snapshots.get(symbol)
+            else:
+                snapshot = snapshots
+
+            if snapshot is None:
+                return Quote(symbol=symbol, bid=0, ask=0, bid_size=0,
+                           ask_size=0, last=0, timestamp=datetime.now())
+
+            quote = getattr(snapshot, 'latest_quote', None)
+            trade = getattr(snapshot, 'latest_trade', None)
         else:
             snapshot = self._retry_with_backoff(
                 self.api.get_snapshot,
                 symbol,
                 feed='iex'
             )
-        quote = snapshot.latest_quote
-        trade = snapshot.latest_trade
+            quote = snapshot.latest_quote
+            trade = snapshot.latest_trade
 
         return Quote(
             symbol=symbol,
@@ -358,7 +379,9 @@ class AlpacaClient:
     def close_position(self, symbol: str):
         """Close a position completely."""
         try:
-            self._retry_with_backoff(self.api.close_position, symbol)
+            # Alpaca uses ETHUSD format for crypto, not ETH/USD
+            api_symbol = symbol.replace("/", "") if settings.is_crypto_symbol(symbol) else symbol
+            self._retry_with_backoff(self.api.close_position, api_symbol)
             logger.info(f"Closed position for {symbol}")
             return True
         except APIError as e:
