@@ -25,7 +25,7 @@ class Settings:
     MAX_DRAWDOWN_HALT: float = 0.10  # 10% drawdown triggers halt
     MAX_POSITION_SIZE: float = 0.10  # 10% max per symbol
     MAX_POSITIONS: int = 10  # Max concurrent positions
-    MAX_TRADES_PER_DAY: int = 10  # Max trades per day
+    MAX_TRADES_PER_DAY: int = 15  # Increased for aggressive trading (was 10)
 
     # PDT Rules
     MAX_DAY_TRADES: int = 3  # PDT rule limit
@@ -63,7 +63,7 @@ class Settings:
     MIN_WIN_RATE: float = 0.40  # Minimum win rate before disabling
     ROLLING_TRADES: int = 20  # Trades for rolling performance
     GRADUAL_REENTRY_START: float = 0.25  # Start weight for re-enabled strategies
-    SIGNAL_THRESHOLD: float = 0.6  # Minimum score to execute trade
+    SIGNAL_THRESHOLD: float = 0.5  # Lowered for aggressive trading (was 0.6)
 
     # RSI Strategy (Optimized via backtest)
     RSI_PERIOD: int = 14  # RSI calculation period
