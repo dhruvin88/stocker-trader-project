@@ -29,7 +29,7 @@ class AccountInfo:
 class Position:
     """Position information from Alpaca."""
     symbol: str
-    qty: int
+    qty: float  # Changed to float for crypto fractional support
     avg_entry_price: float
     current_price: float
     market_value: float
@@ -158,7 +158,7 @@ class AlpacaClient:
         return [
             Position(
                 symbol=p.symbol,
-                qty=int(p.qty),
+                qty=float(p.qty),  # Use float for crypto fractional support
                 avg_entry_price=float(p.avg_entry_price),
                 current_price=float(p.current_price),
                 market_value=float(p.market_value),
