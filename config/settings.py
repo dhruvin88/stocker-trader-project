@@ -102,6 +102,49 @@ class Settings:
     TWILIO_FROM_NUMBER: str = field(default_factory=lambda: os.getenv("TWILIO_FROM_NUMBER", ""))
     TWILIO_TO_NUMBER: str = field(default_factory=lambda: os.getenv("TWILIO_TO_NUMBER", ""))
 
+    # Options Trading
+    OPTIONS_ENABLED: bool = field(
+        default_factory=lambda: os.getenv("OPTIONS_ENABLED", "false").lower() == "true"
+    )
+    MAX_OPTIONS_POSITIONS: int = 5  # Max concurrent options positions
+    MAX_OPTIONS_POSITION_SIZE: float = 0.05  # 5% of portfolio per option position
+    MAX_CONTRACTS_PER_POSITION: int = 10  # Max contracts per single position
+    MIN_DAYS_TO_EXPIRATION: int = 7  # Don't buy expiring within 7 days
+    MAX_DAYS_TO_EXPIRATION: int = 60  # Focus on near-term expirations
+    MIN_IMPLIED_VOLATILITY: float = 0.15  # 15% min IV
+    MAX_IMPLIED_VOLATILITY: float = 1.0  # 100% max IV (filter out extreme)
+    OPTIONS_APPROVAL_LEVEL: int = 2  # Required Alpaca approval level
+
+    # Greeks Limits
+    MAX_DELTA_EXPOSURE: float = 0.3  # Max 30% delta-adjusted exposure
+    MIN_THETA_RATIO: float = -0.05  # Limit time decay to 5% per day
+
+    # Options Liquidity Filters
+    MIN_OPTION_OPEN_INTEREST: int = 100  # Minimum open interest
+    MAX_BID_ASK_SPREAD_PCT: float = 10.0  # Max 10% bid-ask spread
+
+    # Covered Call Settings
+    COVERED_CALL_OTM_PERCENT: float = 5.0  # 5% OTM for covered calls
+    COVERED_CALL_MIN_PREMIUM_PCT: float = 1.0  # Min 1% premium
+    COVERED_CALL_MIN_DELTA: float = 0.2  # Min delta 0.2
+    COVERED_CALL_MAX_DELTA: float = 0.4  # Max delta 0.4
+    COVERED_CALL_TARGET_DTE: int = 30  # Target 30 days to expiration
+
+    # Protective Put Settings
+    PROTECTIVE_PUT_OTM_PERCENT: float = 5.0  # 5% OTM for protective puts
+    PROTECTIVE_PUT_MAX_COST_PCT: float = 2.0  # Max 2% of position value
+    PROTECTIVE_PUT_MIN_DELTA: float = 0.2  # Min delta magnitude
+    PROTECTIVE_PUT_MAX_DELTA: float = 0.4  # Max delta magnitude
+
+    # Vertical Spread Settings
+    VERTICAL_SPREAD_WIDTH_PERCENT: float = 5.0  # 5% spread width
+    VERTICAL_SPREAD_MIN_RISK_REWARD: float = 1.5  # Min 1.5:1 risk/reward
+    VERTICAL_SPREAD_TARGET_DTE: int = 30  # Target 30 days to expiration
+
+    # Unusual Activity Settings
+    UNUSUAL_VOLUME_THRESHOLD: float = 3.0  # 3x average volume
+    UNUSUAL_OI_CHANGE_THRESHOLD: float = 0.5  # 50% OI increase
+
     def is_paper_trading(self) -> bool:
         """Check if currently in paper trading mode."""
         return self.PAPER_TRADING or "paper" in self.ALPACA_BASE_URL.lower()

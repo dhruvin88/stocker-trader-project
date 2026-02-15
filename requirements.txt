@@ -35,3 +35,6 @@ pytest>=7.4.0
 
 # Type hints
 typing-extensions>=4.8.0
+
+# Options Greeks
+py-vollib>=1.0.1

@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date
 from enum import Enum
 from typing import Optional, Any
 
@@ -67,6 +67,50 @@ class Signal:
             "timeframe": self.timeframe,
             "metadata": self.metadata
         }
+
+
+@dataclass
+class OptionsSignal(Signal):
+    """
+    Extended signal for options strategies.
+
+    Inherits all Signal attributes and adds options-specific fields.
+
+    Additional Attributes:
+        contract_symbol: Full OCC option symbol (e.g., "AAPL230120C00150000")
+        contract_type: "call" or "put"
+        strike: Strike price
+        expiration: Expiration date
+        premium: Option premium price
+        max_risk: Maximum risk for the position
+        max_profit: Maximum profit for the position
+        legs: List of OptionLeg objects for multi-leg strategies
+        greeks: OptionGreeks for this contract
+    """
+    contract_symbol: Optional[str] = None
+    contract_type: Optional[str] = None
+    strike: Optional[float] = None
+    expiration: Optional[date] = None
+    premium: Optional[float] = None
+    max_risk: Optional[float] = None
+    max_profit: Optional[float] = None
+    legs: Optional[list] = None  # List of OptionLeg objects
+    greeks: Optional[Any] = None  # OptionGreeks object
+
+    def to_dict(self) -> dict:
+        """Convert options signal to dictionary."""
+        base_dict = super().to_dict()
+        base_dict.update({
+            "contract_symbol": self.contract_symbol,
+            "contract_type": self.contract_type,
+            "strike": self.strike,
+            "expiration": self.expiration.isoformat() if self.expiration else None,
+            "premium": self.premium,
+            "max_risk": self.max_risk,
+            "max_profit": self.max_profit,
+            "legs_count": len(self.legs) if self.legs else 0
+        })
+        return base_dict
 
 
 class BaseStrategy(ABC):

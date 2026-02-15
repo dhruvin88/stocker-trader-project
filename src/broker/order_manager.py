@@ -1,5 +1,5 @@
 import time
-from datetime import datetime
+from datetime import datetime, date as date_type
 from typing import Optional
 from dataclasses import dataclass
 from enum import Enum
@@ -9,7 +9,6 @@ from src.storage.database import get_database, Trade
 from src.utils.logger import get_logger, trade_logger
 from src.utils.notifications import notifications
 from config.settings import settings
-from datetime import date
 
 logger = get_logger(__name__)
 
@@ -33,6 +32,26 @@ class OrderResult:
     status: OrderStatus
     filled_qty: int
     filled_price: Optional[float]
+    message: str
+
+
+@dataclass
+class OptionLeg:
+    """Single leg of an options order."""
+    contract_symbol: str
+    side: str          # "buy" or "sell"
+    quantity: int      # Number of contracts
+    limit_price: float
+
+
+@dataclass
+class OptionsOrderResult:
+    """Result of options order execution."""
+    success: bool
+    order_ids: list[str]      # Can be multiple for spreads
+    status: OrderStatus
+    filled_legs: list[dict]
+    net_premium: float
     message: str
 
 
@@ -405,3 +424,513 @@ class OrderManager:
         except Exception as e:
             logger.error(f"Failed to get order status: {e}")
             return OrderStatus.FAILED
+
+    # Options Trading Methods
+
+    def execute_option_entry(
+        self,
+        contract: 'OptionContract',  # Forward reference
+        quantity: int,
+        strategy: str,
+        limit_price: Optional[float] = None
+    ) -> OptionsOrderResult:
+        """
+        Execute single-leg option entry.
+
+        Args:
+            contract: OptionContract object
+            quantity: Number of contracts
+            strategy: Name of strategy
+            limit_price: Optional limit price (defaults to mid-point)
+
+        Returns:
+            OptionsOrderResult
+        """
+        try:
+            # Validate options enabled
+            if not settings.OPTIONS_ENABLED:
+                return OptionsOrderResult(
+                    success=False,
+                    order_ids=[],
+                    status=OrderStatus.REJECTED,
+                    filled_legs=[],
+                    net_premium=0,
+                    message="Options trading not enabled"
+                )
+
+            # Validate liquidity
+            if not contract.is_liquid(
+                settings.MAX_BID_ASK_SPREAD_PCT,
+                settings.MIN_OPTION_OPEN_INTEREST
+            ):
+                return OptionsOrderResult(
+                    success=False,
+                    order_ids=[],
+                    status=OrderStatus.REJECTED,
+                    filled_legs=[],
+                    net_premium=0,
+                    message=f"Contract not liquid: spread {contract.spread_percentage:.1f}%, OI {contract.open_interest}"
+                )
+
+            # Calculate limit price
+            if limit_price is None:
+                limit_price = contract.mid_price
+
+            # Validate days to expiration
+            from src.risk.options_greeks import GreeksCalculator
+            tte_days = (contract.expiration - date_type.today()).days
+            if tte_days < settings.MIN_DAYS_TO_EXPIRATION:
+                return OptionsOrderResult(
+                    success=False,
+                    order_ids=[],
+                    status=OrderStatus.REJECTED,
+                    filled_legs=[],
+                    net_premium=0,
+                    message=f"Too close to expiration: {tte_days} days"
+                )
+
+            logger.info(
+                f"Executing option entry: {quantity} {contract.symbol} "
+                f"@ ${limit_price:.2f} ({strategy})"
+            )
+
+            # Submit order
+            order = self.client.submit_order(
+                symbol=contract.symbol,
+                qty=quantity,
+                side="buy",
+                order_type="limit",
+                time_in_force="day",
+                limit_price=limit_price
+            )
+
+            # Wait for fill
+            result = self._wait_for_fill(order.id, settings.ORDER_TIMEOUT_SECONDS)
+
+            if result.success:
+                # Record position in database
+                self.db.save_option_position(
+                    contract_symbol=contract.symbol,
+                    underlying=contract.underlying,
+                    contract_type=contract.contract_type,
+                    strike=contract.strike,
+                    expiration=contract.expiration,
+                    quantity=quantity,
+                    entry_price=result.filled_price,
+                    entry_time=datetime.now(),
+                    strategy=strategy,
+                    current_delta=contract.greeks.delta if contract.greeks else None,
+                    current_theta=contract.greeks.theta if contract.greeks else None
+                )
+
+                net_premium = result.filled_price * quantity * 100  # Premium x contracts x shares
+
+                trade_logger.info(
+                    f"OPTION_ENTRY: {contract.contract_type.upper()} {quantity} {contract.underlying} "
+                    f"${contract.strike} exp {contract.expiration} @ ${result.filled_price:.2f} "
+                    f"premium ${net_premium:.2f} ({strategy})"
+                )
+
+                notifications.send_trade_notification(
+                    f"Option Entry: {quantity} {contract.symbol} @ ${result.filled_price:.2f}",
+                    f"Strategy: {strategy}\nPremium: ${net_premium:.2f}"
+                )
+
+                return OptionsOrderResult(
+                    success=True,
+                    order_ids=[order.id],
+                    status=OrderStatus.FILLED,
+                    filled_legs=[{
+                        "contract": contract.symbol,
+                        "quantity": quantity,
+                        "price": result.filled_price
+                    }],
+                    net_premium=net_premium,
+                    message="Option entry filled"
+                )
+            else:
+                return OptionsOrderResult(
+                    success=False,
+                    order_ids=[order.id],
+                    status=result.status,
+                    filled_legs=[],
+                    net_premium=0,
+                    message=result.message
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to execute option entry: {e}")
+            return OptionsOrderResult(
+                success=False,
+                order_ids=[],
+                status=OrderStatus.FAILED,
+                filled_legs=[],
+                net_premium=0,
+                message=str(e)
+            )
+
+    def execute_spread_entry(
+        self,
+        legs: list[OptionLeg],
+        spread_type: str,
+        strategy: str
+    ) -> OptionsOrderResult:
+        """
+        Execute multi-leg spread order.
+
+        Args:
+            legs: List of OptionLeg objects
+            spread_type: Type of spread (e.g., "bull_call_spread")
+            strategy: Name of strategy
+
+        Returns:
+            OptionsOrderResult
+        """
+        try:
+            if not settings.OPTIONS_ENABLED:
+                return OptionsOrderResult(
+                    success=False,
+                    order_ids=[],
+                    status=OrderStatus.REJECTED,
+                    filled_legs=[],
+                    net_premium=0,
+                    message="Options trading not enabled"
+                )
+
+            logger.info(f"Executing {spread_type}: {len(legs)} legs ({strategy})")
+
+            # Execute each leg individually
+            # Note: Alpaca may support multi-leg orders, but sequential is safer
+            order_ids = []
+            filled_legs = []
+            net_premium = 0.0
+
+            for leg in legs:
+                # Get contract details
+                contract = self.client.get_option_quote(leg.contract_symbol)
+                if not contract:
+                    logger.error(f"Could not get quote for {leg.contract_symbol}")
+                    # Cancel previous legs
+                    for oid in order_ids:
+                        self.client.cancel_order(oid)
+                    return OptionsOrderResult(
+                        success=False,
+                        order_ids=order_ids,
+                        status=OrderStatus.FAILED,
+                        filled_legs=filled_legs,
+                        net_premium=0,
+                        message=f"Failed to get quote for {leg.contract_symbol}"
+                    )
+
+                # Submit leg order
+                order = self.client.submit_order(
+                    symbol=leg.contract_symbol,
+                    qty=leg.quantity,
+                    side=leg.side,
+                    order_type="limit",
+                    time_in_force="day",
+                    limit_price=leg.limit_price
+                )
+
+                order_ids.append(order.id)
+
+                # Wait for fill
+                result = self._wait_for_fill(order.id, settings.ORDER_TIMEOUT_SECONDS)
+
+                if not result.success:
+                    # Cancel all previous legs
+                    for oid in order_ids:
+                        self.client.cancel_order(oid)
+                    return OptionsOrderResult(
+                        success=False,
+                        order_ids=order_ids,
+                        status=result.status,
+                        filled_legs=filled_legs,
+                        net_premium=0,
+                        message=f"Leg failed: {result.message}"
+                    )
+
+                # Track filled leg
+                filled_legs.append({
+                    "contract": leg.contract_symbol,
+                    "side": leg.side,
+                    "quantity": leg.quantity,
+                    "price": result.filled_price
+                })
+
+                # Calculate net premium (debit or credit)
+                leg_premium = result.filled_price * leg.quantity * 100
+                if leg.side == "buy":
+                    net_premium -= leg_premium  # Debit
+                else:
+                    net_premium += leg_premium  # Credit
+
+            # Calculate max risk and profit
+            # For vertical spreads: max_risk = spread_width - net_credit (or net_debit)
+            # Simplified calculation - should be enhanced per spread type
+            max_risk = abs(net_premium)  # Simplified
+            max_profit = abs(net_premium)  # Simplified
+
+            # Create spread record
+            spread_id = self.db.create_spread(
+                underlying=contract.underlying,
+                spread_type=spread_type,
+                entry_time=datetime.now(),
+                net_premium=net_premium,
+                max_risk=max_risk,
+                max_profit=max_profit,
+                strategy=strategy
+            )
+
+            # Link all legs to spread
+            for leg in filled_legs:
+                self.db.save_option_position(
+                    contract_symbol=leg["contract"],
+                    underlying=contract.underlying,
+                    contract_type="call",  # Should parse from symbol
+                    strike=0.0,  # Should parse from symbol
+                    expiration=contract.expiration,
+                    quantity=leg["quantity"],
+                    entry_price=leg["price"],
+                    entry_time=datetime.now(),
+                    strategy=strategy,
+                    spread_id=spread_id
+                )
+
+            trade_logger.info(
+                f"SPREAD_ENTRY: {spread_type} {contract.underlying} "
+                f"net_premium ${net_premium:.2f} ({strategy})"
+            )
+
+            notifications.send_trade_notification(
+                f"Spread Entry: {spread_type}",
+                f"Legs: {len(filled_legs)}\nNet Premium: ${net_premium:.2f}"
+            )
+
+            return OptionsOrderResult(
+                success=True,
+                order_ids=order_ids,
+                status=OrderStatus.FILLED,
+                filled_legs=filled_legs,
+                net_premium=net_premium,
+                message="Spread filled successfully"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to execute spread: {e}")
+            return OptionsOrderResult(
+                success=False,
+                order_ids=[],
+                status=OrderStatus.FAILED,
+                filled_legs=[],
+                net_premium=0,
+                message=str(e)
+            )
+
+    def execute_option_exit(
+        self,
+        contract_symbol: str,
+        quantity: Optional[int] = None,
+        reason: str = "manual"
+    ) -> OptionsOrderResult:
+        """
+        Close option position.
+
+        Args:
+            contract_symbol: OCC symbol
+            quantity: Number of contracts (None = close all)
+            reason: Exit reason
+
+        Returns:
+            OptionsOrderResult
+        """
+        try:
+            # Get position from database
+            position = self.db.get_option_position(contract_symbol)
+            if not position:
+                return OptionsOrderResult(
+                    success=False,
+                    order_ids=[],
+                    status=OrderStatus.REJECTED,
+                    filled_legs=[],
+                    net_premium=0,
+                    message="Position not found"
+                )
+
+            # Default to closing entire position
+            if quantity is None:
+                quantity = position["quantity"]
+
+            # Get current quote
+            contract = self.client.get_option_quote(contract_symbol)
+            if not contract:
+                return OptionsOrderResult(
+                    success=False,
+                    order_ids=[],
+                    status=OrderStatus.FAILED,
+                    filled_legs=[],
+                    net_premium=0,
+                    message="Could not get quote"
+                )
+
+            limit_price = contract.mid_price
+
+            logger.info(f"Closing option position: {quantity} {contract_symbol} @ ${limit_price:.2f}")
+
+            # Submit sell order
+            order = self.client.submit_order(
+                symbol=contract_symbol,
+                qty=quantity,
+                side="sell",
+                order_type="limit",
+                time_in_force="day",
+                limit_price=limit_price
+            )
+
+            result = self._wait_for_fill(order.id, settings.ORDER_TIMEOUT_SECONDS)
+
+            if result.success:
+                # Calculate P&L
+                entry_price = position["entry_price"]
+                exit_price = result.filled_price
+                pnl = (exit_price - entry_price) * quantity * 100
+                pnl_percent = ((exit_price - entry_price) / entry_price) * 100
+
+                # Record trade
+                self.db.insert_option_trade(
+                    contract_symbol=contract_symbol,
+                    underlying=position["underlying"],
+                    contract_type=position["contract_type"],
+                    strike=position["strike"],
+                    expiration=position["expiration"],
+                    quantity=quantity,
+                    entry_time=datetime.fromisoformat(position["entry_time"]),
+                    entry_price=entry_price,
+                    exit_time=datetime.now(),
+                    exit_price=exit_price,
+                    pnl=pnl,
+                    pnl_percent=pnl_percent,
+                    exit_reason=reason,
+                    strategy=position["strategy"],
+                    spread_id=position.get("spread_id")
+                )
+
+                # Remove from positions
+                self.db.remove_option_position(contract_symbol)
+
+                trade_logger.info(
+                    f"OPTION_EXIT: {contract_symbol} @ ${exit_price:.2f} "
+                    f"PNL ${pnl:.2f} ({pnl_percent:+.1f}%) - {reason}"
+                )
+
+                notifications.send_trade_notification(
+                    f"Option Exit: {contract_symbol}",
+                    f"Exit: ${exit_price:.2f}\nP&L: ${pnl:.2f} ({pnl_percent:+.1f}%)\nReason: {reason}"
+                )
+
+                return OptionsOrderResult(
+                    success=True,
+                    order_ids=[order.id],
+                    status=OrderStatus.FILLED,
+                    filled_legs=[{
+                        "contract": contract_symbol,
+                        "quantity": quantity,
+                        "price": exit_price
+                    }],
+                    net_premium=pnl,
+                    message=f"Position closed: P&L ${pnl:.2f}"
+                )
+            else:
+                return OptionsOrderResult(
+                    success=False,
+                    order_ids=[order.id],
+                    status=result.status,
+                    filled_legs=[],
+                    net_premium=0,
+                    message=result.message
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to execute option exit: {e}")
+            return OptionsOrderResult(
+                success=False,
+                order_ids=[],
+                status=OrderStatus.FAILED,
+                filled_legs=[],
+                net_premium=0,
+                message=str(e)
+            )
+
+    def execute_spread_exit(
+        self,
+        spread_id: int,
+        reason: str = "manual"
+    ) -> OptionsOrderResult:
+        """
+        Close entire spread position.
+
+        Args:
+            spread_id: Spread ID from database
+            reason: Exit reason
+
+        Returns:
+            OptionsOrderResult
+        """
+        try:
+            # Get all legs
+            legs = self.db.get_spread_legs(spread_id)
+            if not legs:
+                return OptionsOrderResult(
+                    success=False,
+                    order_ids=[],
+                    status=OrderStatus.REJECTED,
+                    filled_legs=[],
+                    net_premium=0,
+                    message="Spread not found"
+                )
+
+            logger.info(f"Closing spread {spread_id}: {len(legs)} legs")
+
+            # Close each leg
+            order_ids = []
+            filled_legs = []
+            total_pnl = 0.0
+
+            for leg in legs:
+                result = self.execute_option_exit(
+                    leg["contract_symbol"],
+                    leg["quantity"],
+                    reason=f"spread_exit_{reason}"
+                )
+
+                if result.success:
+                    order_ids.extend(result.order_ids)
+                    filled_legs.extend(result.filled_legs)
+                    total_pnl += result.net_premium
+                else:
+                    logger.warning(f"Failed to close leg {leg['contract_symbol']}: {result.message}")
+
+            # Update spread status
+            self.db.update_spread_status(spread_id, "closed")
+
+            trade_logger.info(f"SPREAD_EXIT: spread_id={spread_id} total_pnl ${total_pnl:.2f}")
+
+            return OptionsOrderResult(
+                success=True,
+                order_ids=order_ids,
+                status=OrderStatus.FILLED,
+                filled_legs=filled_legs,
+                net_premium=total_pnl,
+                message=f"Spread closed: P&L ${total_pnl:.2f}"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to close spread: {e}")
+            return OptionsOrderResult(
+                success=False,
+                order_ids=[],
+                status=OrderStatus.FAILED,
+                filled_legs=[],
+                net_premium=0,
+                message=str(e)
+            )

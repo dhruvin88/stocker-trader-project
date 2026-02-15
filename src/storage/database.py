@@ -170,6 +170,87 @@ class Database:
                 )
             """)
 
+            # Options tables
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS option_positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_symbol TEXT UNIQUE NOT NULL,
+                    underlying TEXT NOT NULL,
+                    contract_type TEXT NOT NULL,
+                    strike REAL NOT NULL,
+                    expiration DATE NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    entry_price REAL NOT NULL,
+                    entry_time TIMESTAMP NOT NULL,
+                    current_delta REAL,
+                    current_theta REAL,
+                    strategy TEXT,
+                    spread_id INTEGER,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (spread_id) REFERENCES option_spreads(id)
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS option_spreads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    underlying TEXT NOT NULL,
+                    spread_type TEXT NOT NULL,
+                    entry_time TIMESTAMP NOT NULL,
+                    net_premium REAL NOT NULL,
+                    max_risk REAL NOT NULL,
+                    max_profit REAL NOT NULL,
+                    strategy TEXT,
+                    status TEXT DEFAULT 'open',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS option_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_symbol TEXT NOT NULL,
+                    underlying TEXT NOT NULL,
+                    contract_type TEXT NOT NULL,
+                    strike REAL NOT NULL,
+                    expiration DATE NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    entry_time TIMESTAMP NOT NULL,
+                    entry_price REAL NOT NULL,
+                    exit_time TIMESTAMP,
+                    exit_price REAL,
+                    pnl REAL,
+                    pnl_percent REAL,
+                    exit_reason TEXT,
+                    strategy TEXT,
+                    spread_id INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (spread_id) REFERENCES option_spreads(id)
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS options_chain_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    underlying TEXT NOT NULL,
+                    contract_symbol TEXT NOT NULL,
+                    strike REAL NOT NULL,
+                    expiration DATE NOT NULL,
+                    contract_type TEXT NOT NULL,
+                    bid REAL,
+                    ask REAL,
+                    volume INTEGER,
+                    open_interest INTEGER,
+                    implied_volatility REAL,
+                    delta REAL,
+                    gamma REAL,
+                    theta REAL,
+                    vega REAL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(contract_symbol, timestamp)
+                )
+            """)
+
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades(entry_time)")
@@ -177,6 +258,9 @@ class Database:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_pdt_date ON pdt_tracker(trade_date)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_wash_sale_symbol ON wash_sale_tracker(symbol)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_wash_sale_date ON wash_sale_tracker(exit_date)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_cache_symbol ON options_chain_cache(underlying, expiration)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_option_positions_underlying ON option_positions(underlying)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_option_trades_underlying ON option_trades(underlying)")
 
         logger.info(f"Database initialized at {self.db_path}")
 
@@ -538,6 +622,290 @@ class Database:
                     f"UPDATE positions SET {', '.join(updates)} WHERE symbol = ?",
                     params
                 )
+
+    # Options trading methods
+
+    def save_option_position(
+        self,
+        contract_symbol: str,
+        underlying: str,
+        contract_type: str,
+        strike: float,
+        expiration: date,
+        quantity: int,
+        entry_price: float,
+        entry_time: datetime,
+        strategy: str,
+        spread_id: Optional[int] = None,
+        current_delta: Optional[float] = None,
+        current_theta: Optional[float] = None
+    ) -> int:
+        """Save or update an option position."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO option_positions (
+                    contract_symbol, underlying, contract_type, strike, expiration,
+                    quantity, entry_price, entry_time, strategy, spread_id,
+                    current_delta, current_theta
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(contract_symbol) DO UPDATE SET
+                    quantity = ?, entry_price = ?, entry_time = ?,
+                    current_delta = ?, current_theta = ?,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (
+                contract_symbol, underlying, contract_type, strike, expiration,
+                quantity, entry_price, entry_time, strategy, spread_id,
+                current_delta, current_theta,
+                quantity, entry_price, entry_time, current_delta, current_theta
+            ))
+            return cursor.lastrowid
+
+    def get_option_positions(self, underlying: Optional[str] = None) -> list[dict]:
+        """Get all option positions, optionally filtered by underlying."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if underlying:
+                cursor.execute(
+                    "SELECT * FROM option_positions WHERE underlying = ?",
+                    (underlying,)
+                )
+            else:
+                cursor.execute("SELECT * FROM option_positions")
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    def get_option_position(self, contract_symbol: str) -> Optional[dict]:
+        """Get a specific option position."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM option_positions WHERE contract_symbol = ?",
+                (contract_symbol,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def remove_option_position(self, contract_symbol: str) -> None:
+        """Remove an option position from tracking."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM option_positions WHERE contract_symbol = ?",
+                (contract_symbol,)
+            )
+
+    def update_option_greeks(
+        self,
+        contract_symbol: str,
+        delta: float,
+        theta: float
+    ) -> None:
+        """Update Greeks for an option position."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE option_positions
+                SET current_delta = ?, current_theta = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE contract_symbol = ?
+            """, (delta, theta, contract_symbol))
+
+    def insert_option_trade(
+        self,
+        contract_symbol: str,
+        underlying: str,
+        contract_type: str,
+        strike: float,
+        expiration: date,
+        quantity: int,
+        entry_time: datetime,
+        entry_price: float,
+        exit_time: Optional[datetime],
+        exit_price: Optional[float],
+        pnl: Optional[float],
+        pnl_percent: Optional[float],
+        exit_reason: Optional[str],
+        strategy: str,
+        spread_id: Optional[int] = None
+    ) -> int:
+        """Insert a completed option trade."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO option_trades (
+                    contract_symbol, underlying, contract_type, strike, expiration,
+                    quantity, entry_time, entry_price, exit_time, exit_price,
+                    pnl, pnl_percent, exit_reason, strategy, spread_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                contract_symbol, underlying, contract_type, strike, expiration,
+                quantity, entry_time, entry_price, exit_time, exit_price,
+                pnl, pnl_percent, exit_reason, strategy, spread_id
+            ))
+            return cursor.lastrowid
+
+    def get_option_trades(
+        self,
+        underlying: Optional[str] = None,
+        days: int = 30
+    ) -> list[dict]:
+        """Get option trades, optionally filtered by underlying and days."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if underlying:
+                cursor.execute("""
+                    SELECT * FROM option_trades
+                    WHERE underlying = ? AND entry_time >= DATE('now', ?)
+                    ORDER BY entry_time DESC
+                """, (underlying, f"-{days} days"))
+            else:
+                cursor.execute("""
+                    SELECT * FROM option_trades
+                    WHERE entry_time >= DATE('now', ?)
+                    ORDER BY entry_time DESC
+                """, (f"-{days} days",))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    def create_spread(
+        self,
+        underlying: str,
+        spread_type: str,
+        entry_time: datetime,
+        net_premium: float,
+        max_risk: float,
+        max_profit: float,
+        strategy: str
+    ) -> int:
+        """Create a new option spread record."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO option_spreads (
+                    underlying, spread_type, entry_time, net_premium,
+                    max_risk, max_profit, strategy
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (underlying, spread_type, entry_time, net_premium,
+                  max_risk, max_profit, strategy))
+            return cursor.lastrowid
+
+    def get_active_spreads(self, underlying: Optional[str] = None) -> list[dict]:
+        """Get all active spreads, optionally filtered by underlying."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if underlying:
+                cursor.execute("""
+                    SELECT * FROM option_spreads
+                    WHERE status = 'open' AND underlying = ?
+                    ORDER BY entry_time DESC
+                """, (underlying,))
+            else:
+                cursor.execute("""
+                    SELECT * FROM option_spreads
+                    WHERE status = 'open'
+                    ORDER BY entry_time DESC
+                """)
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    def get_spread(self, spread_id: int) -> Optional[dict]:
+        """Get a specific spread."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM option_spreads WHERE id = ?",
+                (spread_id,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def update_spread_status(self, spread_id: int, status: str) -> None:
+        """Update spread status (open, closed, expired, assigned)."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE option_spreads
+                SET status = ?
+                WHERE id = ?
+            """, (status, spread_id))
+
+    def get_spread_legs(self, spread_id: int) -> list[dict]:
+        """Get all option positions that are part of a spread."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM option_positions
+                WHERE spread_id = ?
+            """, (spread_id,))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    def cache_options_chain(
+        self,
+        underlying: str,
+        contract_symbol: str,
+        strike: float,
+        expiration: date,
+        contract_type: str,
+        bid: float,
+        ask: float,
+        volume: int,
+        open_interest: int,
+        implied_volatility: float,
+        delta: float,
+        gamma: float,
+        theta: float,
+        vega: float
+    ) -> None:
+        """Cache options chain data for historical analysis."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO options_chain_cache (
+                    underlying, contract_symbol, strike, expiration, contract_type,
+                    bid, ask, volume, open_interest, implied_volatility,
+                    delta, gamma, theta, vega
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                underlying, contract_symbol, strike, expiration, contract_type,
+                bid, ask, volume, open_interest, implied_volatility,
+                delta, gamma, theta, vega
+            ))
+
+    def get_cached_chain(
+        self,
+        underlying: str,
+        max_age_minutes: int = 15
+    ) -> list[dict]:
+        """Get cached options chain data."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM options_chain_cache
+                WHERE underlying = ?
+                AND timestamp >= DATETIME('now', ?)
+                ORDER BY timestamp DESC
+            """, (underlying, f"-{max_age_minutes} minutes"))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    def get_historical_option_volume(
+        self,
+        contract_symbol: str,
+        days: int = 20
+    ) -> list[dict]:
+        """Get historical volume data for an option contract."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT timestamp, volume, open_interest
+                FROM options_chain_cache
+                WHERE contract_symbol = ?
+                AND timestamp >= DATETIME('now', ?)
+                ORDER BY timestamp ASC
+            """, (contract_symbol, f"-{days} days"))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
 
 
 _db_instance: Optional[Database] = None

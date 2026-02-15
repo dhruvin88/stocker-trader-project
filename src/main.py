@@ -25,6 +25,7 @@ from src.risk.position_sizer import PositionSizer
 from src.risk.stop_manager import StopManager
 from src.strategies.technical.rsi_strategy import RSIStrategy
 from src.strategies.technical.momentum_breakout_strategy import MomentumBreakoutStrategy
+from src.strategies.base import OptionsSignal
 
 logger = get_logger(__name__)
 
@@ -46,6 +47,23 @@ class TradingBot:
             MomentumBreakoutStrategy(),  # Primary: 239 trades/year, +$1,766 in backtest
             RSIStrategy()                 # Backup: Mean reversion on extreme RSI
         ]
+
+        # Options strategies (if enabled)
+        self.options_strategies = []
+        if settings.OPTIONS_ENABLED:
+            from src.strategies.options import (
+                CoveredCallStrategy,
+                ProtectivePutStrategy,
+                VerticalSpreadStrategy,
+                UnusualOptionsActivity
+            )
+            self.options_strategies = [
+                CoveredCallStrategy(),      # Income: Sell calls on long positions
+                ProtectivePutStrategy(),    # Protection: Buy puts for downside insurance
+                VerticalSpreadStrategy(),   # Directional: Bull/bear spreads
+                UnusualOptionsActivity()    # Momentum: Trade unusual volume/OI
+            ]
+            logger.info(f"Options trading enabled with {len(self.options_strategies)} strategies")
 
         self.watchlist = [
             "AAPL", "MSFT", "GOOGL", "AMZN", "META",
@@ -95,6 +113,8 @@ class TradingBot:
         logger.info(f"PDT Status: {pdt_status['day_trades_remaining']} day trades remaining")
 
         logger.info(f"Active Strategies: {[s.name for s in self.strategies if s.enabled]}")
+        if settings.OPTIONS_ENABLED:
+            logger.info(f"Options Strategies: {[s.name for s in self.options_strategies if s.enabled]}")
         logger.info(f"Watchlist: {len(self.watchlist)} symbols")
 
         self._setup_schedule()
@@ -171,11 +191,76 @@ class TradingBot:
         try:
             self.stop_manager.execute_stop_exits()
 
+            # Check options positions for expiration and exit criteria
+            if settings.OPTIONS_ENABLED:
+                self._check_options_positions()
+
             if not self._check_risk_limits():
                 self._halt_trading("Risk limit breached")
 
         except Exception as e:
             logger.error(f"Error checking positions: {e}")
+
+    def _check_options_positions(self) -> None:
+        """Monitor options positions for expiration and exit criteria."""
+        try:
+            from datetime import date
+
+            option_positions = self.db.get_option_positions()
+
+            for position in option_positions:
+                contract_symbol = position['contract_symbol']
+                expiration = date.fromisoformat(position['expiration']) if isinstance(position['expiration'], str) else position['expiration']
+                strategy_name = position['strategy']
+
+                # Check days to expiration
+                dte = (expiration - date.today()).days
+
+                # Auto-close if expiring within 3 days
+                if dte <= 3:
+                    logger.info(f"Auto-closing {contract_symbol} - expiring in {dte} days")
+                    result = self.order_manager.execute_option_exit(
+                        contract_symbol=contract_symbol,
+                        reason="approaching_expiration"
+                    )
+                    if result.success:
+                        logger.info(f"Closed {contract_symbol}: {result.message}")
+                    continue
+
+                # Check strategy-specific exit criteria
+                # Find the strategy that owns this position
+                for strategy in self.options_strategies:
+                    if strategy.name == strategy_name:
+                        # Get current price data for the underlying
+                        bars = self.client.get_bars(
+                            position['underlying'],
+                            timeframe="1Day",
+                            limit=50
+                        )
+
+                        if bars:
+                            import pandas as pd
+                            df = pd.DataFrame([{
+                                'open': bar.o,
+                                'high': bar.h,
+                                'low': bar.l,
+                                'close': bar.c,
+                                'volume': bar.v
+                            } for bar in bars])
+
+                            should_exit, reason = strategy.should_exit(position['underlying'], df)
+
+                            if should_exit:
+                                logger.info(f"Strategy exit signal for {contract_symbol}: {reason}")
+                                result = self.order_manager.execute_option_exit(
+                                    contract_symbol=contract_symbol,
+                                    reason=reason
+                                )
+                                if result.success:
+                                    logger.info(f"Closed {contract_symbol}: {result.message}")
+
+        except Exception as e:
+            logger.error(f"Error checking options positions: {e}")
 
     def _scan_for_signals(self) -> None:
         """Scan watchlist for trading signals."""
@@ -206,6 +291,10 @@ class TradingBot:
                 for signal in signals:
                     if signal.is_actionable(settings.SIGNAL_THRESHOLD):
                         self._process_signal(signal)
+
+            # Scan for options signals (only during market hours for now)
+            if is_stock_trading_time and settings.OPTIONS_ENABLED:
+                self._scan_for_options_signals()
 
         except Exception as e:
             logger.error(f"Error scanning for signals: {e}")
@@ -282,6 +371,155 @@ class TradingBot:
         else:
             logger.warning(f"Trade failed for {signal.symbol}: {result.message}")
 
+    def _scan_for_options_signals(self) -> None:
+        """Scan for options trading opportunities."""
+        try:
+            for strategy in self.options_strategies:
+                if not strategy.enabled:
+                    continue
+
+                # Options strategies analyze all watchlist symbols
+                signals = strategy.analyze(self.watchlist)
+
+                for signal in signals:
+                    if isinstance(signal, OptionsSignal) and signal.is_actionable(settings.SIGNAL_THRESHOLD):
+                        self._process_options_signal(signal)
+
+        except Exception as e:
+            logger.error(f"Error scanning for options signals: {e}")
+
+    def _process_options_signal(self, signal: OptionsSignal) -> None:
+        """Process and potentially execute an options trading signal."""
+
+        # Check if this is a multi-leg spread or single-leg option
+        is_spread = signal.legs is not None and len(signal.legs) > 1
+
+        if is_spread:
+            spread_type = signal.metadata.get('spread_type', 'spread')
+            logger.info(
+                f"Options Spread Signal: {spread_type.upper()} {signal.symbol} "
+                f"exp {signal.expiration} "
+                f"(confidence: {signal.confidence:.2f}, strategy: {signal.strategy})"
+            )
+        else:
+            logger.info(
+                f"Options Signal: {signal.direction.value.upper()} {signal.symbol} "
+                f"{signal.contract_type} ${signal.strike} exp {signal.expiration} "
+                f"(confidence: {signal.confidence:.2f}, strategy: {signal.strategy})"
+            )
+
+        # Check max options positions
+        current_options = len(self.db.get_option_positions())
+        if current_options >= settings.MAX_OPTIONS_POSITIONS:
+            logger.info(f"Max options positions ({settings.MAX_OPTIONS_POSITIONS}) reached, skipping")
+            return
+
+        # Handle spread orders differently
+        if is_spread:
+            self._execute_spread_signal(signal)
+        else:
+            self._execute_single_leg_signal(signal)
+
+    def _execute_single_leg_signal(self, signal: OptionsSignal) -> None:
+        """Execute a single-leg option signal."""
+        # Check if we already have this exact option position
+        existing_option = self.db.get_option_position(signal.contract_symbol)
+        if existing_option:
+            logger.info(f"Already have option position {signal.contract_symbol}, skipping")
+            return
+
+        # Get the contract details
+        contract = self.client.get_option_quote(signal.contract_symbol)
+        if not contract:
+            logger.warning(f"Could not get quote for {signal.contract_symbol}")
+            return
+
+        # Calculate position size
+        position_size = self.position_sizer.calculate_option_position_size(
+            contract=contract,
+            is_debit=(signal.direction.value == "long")  # Buying = debit
+        )
+
+        if not position_size.valid:
+            logger.warning(f"Invalid options position size: {position_size.reason}")
+            return
+
+        # Validate Greeks
+        if contract.greeks:
+            greeks_valid, greeks_reason = self.position_sizer.validate_options_greeks(
+                position_size.contracts,
+                contract
+            )
+            if not greeks_valid:
+                logger.warning(f"Greeks validation failed: {greeks_reason}")
+                return
+
+        # Execute the options trade
+        result = self.order_manager.execute_option_entry(
+            contract=contract,
+            quantity=position_size.contracts,
+            strategy=signal.strategy
+        )
+
+        if result.success:
+            self._trades_today += 1
+            logger.info(
+                f"Options trade executed: {position_size.contracts} contracts "
+                f"{signal.contract_symbol} @ ${result.filled_legs[0]['price']:.2f} "
+                f"(premium: ${position_size.total_premium:.2f})"
+            )
+
+            # Record signal
+            from src.storage.database import Signal as DBSignal
+            db_signal = DBSignal(
+                id=None,
+                symbol=signal.symbol,
+                direction=signal.direction.value,
+                confidence=signal.confidence,
+                strategy=signal.strategy,
+                timestamp=signal.timestamp,
+                taken=True,
+                reason=f"options_{signal.contract_type}"
+            )
+            self.db.insert_signal(db_signal)
+        else:
+            logger.warning(f"Options trade failed for {signal.contract_symbol}: {result.message}")
+
+    def _execute_spread_signal(self, signal: OptionsSignal) -> None:
+        """Execute a multi-leg spread signal."""
+        spread_type = signal.metadata.get('spread_type', 'vertical_spread')
+
+        # Execute spread order
+        result = self.order_manager.execute_spread_entry(
+            legs=signal.legs,
+            spread_type=spread_type,
+            strategy=signal.strategy
+        )
+
+        if result.success:
+            self._trades_today += 1
+            logger.info(
+                f"Spread executed: {spread_type} on {signal.symbol} "
+                f"net premium ${result.net_premium:.2f} "
+                f"max risk ${signal.max_risk:.2f} max profit ${signal.max_profit:.2f}"
+            )
+
+            # Record signal
+            from src.storage.database import Signal as DBSignal
+            db_signal = DBSignal(
+                id=None,
+                symbol=signal.symbol,
+                direction=signal.direction.value,
+                confidence=signal.confidence,
+                strategy=signal.strategy,
+                timestamp=signal.timestamp,
+                taken=True,
+                reason=f"options_spread_{spread_type}"
+            )
+            self.db.insert_signal(db_signal)
+        else:
+            logger.warning(f"Spread execution failed for {signal.symbol}: {result.message}")
+
     def _would_be_day_trade(self, symbol: str) -> bool:
         """Check if closing a position today would be a day trade."""
         return self.pdt_tracker.is_position_from_today(symbol)
@@ -344,6 +582,18 @@ class TradingBot:
             logger.info("-" * 40)
             logger.info(f"Portfolio: ${account.portfolio_value:,.2f}")
             logger.info(f"Positions: {len(positions)}")
+
+            # Options positions summary
+            if settings.OPTIONS_ENABLED:
+                option_positions = self.db.get_option_positions()
+                if option_positions:
+                    logger.info(f"Options Positions: {len(option_positions)}/{settings.MAX_OPTIONS_POSITIONS}")
+                    total_option_premium = sum(
+                        pos['entry_price'] * pos['quantity'] * 100
+                        for pos in option_positions
+                    )
+                    logger.info(f"Options Premium: ${total_option_premium:,.2f}")
+
             logger.info(f"Day Trades Used: {pdt_status['day_trades_used']}/{settings.MAX_DAY_TRADES}")
             logger.info(f"Trades Today: {self._trades_today}")
             if wash_sale_status['restricted_count'] > 0:

@@ -21,6 +21,19 @@ class PositionSize:
     reason: str
 
 
+@dataclass
+class OptionsPositionSize:
+    """Position sizing result for options."""
+    contracts: int              # Number of contracts
+    premium_per_contract: float
+    total_premium: float        # Total cost
+    max_risk: float            # For spreads
+    delta_exposure: float      # Stock equivalent exposure
+    theta_per_day: float       # Time decay
+    valid: bool
+    reason: str
+
+
 class PositionSizer:
     """
     Calculates position sizes based on risk management rules.
@@ -299,6 +312,197 @@ class PositionSizer:
                 existing = any(p.symbol == symbol for p in positions)
                 if not existing:
                     return False, f"Max positions ({self.max_positions}) reached"
+
+            return True, "OK"
+
+        except Exception as e:
+            return False, str(e)
+
+    def calculate_option_position_size(
+        self,
+        contract: 'OptionContract',  # Forward reference
+        is_debit: bool = True,
+        spread_width: Optional[float] = None
+    ) -> OptionsPositionSize:
+        """
+        Calculate position size for options using risk-based approach.
+
+        Args:
+            contract: OptionContract object
+            is_debit: True if buying options, False if selling
+            spread_width: For spreads, the width between strikes
+
+        Returns:
+            OptionsPositionSize with calculated values
+        """
+        try:
+            account = self.client.get_account()
+            buying_power = account.buying_power
+            portfolio_value = account.portfolio_value
+
+            # Get current options positions count
+            from src.storage.database import get_database
+            db = get_database()
+            current_options = len(db.get_option_positions())
+
+            # Check max options positions
+            if current_options >= settings.MAX_OPTIONS_POSITIONS:
+                return OptionsPositionSize(
+                    contracts=0,
+                    premium_per_contract=0,
+                    total_premium=0,
+                    max_risk=0,
+                    delta_exposure=0,
+                    theta_per_day=0,
+                    valid=False,
+                    reason=f"Max options positions ({settings.MAX_OPTIONS_POSITIONS}) reached"
+                )
+
+            # Risk-based sizing
+            max_risk_dollars = portfolio_value * settings.MAX_RISK_PER_TRADE
+
+            if is_debit:
+                # Buying options: risk = premium paid
+                risk_per_contract = contract.ask * 100
+                max_contracts_by_risk = int(max_risk_dollars / risk_per_contract)
+            else:
+                # Selling options: risk = potential loss
+                if spread_width:
+                    # Defined risk spread
+                    risk_per_contract = spread_width * 100
+                else:
+                    # Naked options - use margin requirement estimate
+                    risk_per_contract = contract.strike * 100 * 0.2  # Rough margin
+                max_contracts_by_risk = int(max_risk_dollars / risk_per_contract)
+
+            # Apply position size limit
+            max_position_dollars = portfolio_value * settings.MAX_OPTIONS_POSITION_SIZE
+            max_contracts_by_position = int(max_position_dollars / (contract.ask * 100))
+
+            # Apply absolute limit
+            max_contracts_by_limit = settings.MAX_CONTRACTS_PER_POSITION
+
+            # Take minimum of all constraints
+            contracts = min(
+                max_contracts_by_risk,
+                max_contracts_by_position,
+                max_contracts_by_limit
+            )
+
+            # Validate
+            if contracts <= 0:
+                return OptionsPositionSize(
+                    contracts=0,
+                    premium_per_contract=0,
+                    total_premium=0,
+                    max_risk=0,
+                    delta_exposure=0,
+                    theta_per_day=0,
+                    valid=False,
+                    reason="Insufficient capital for option position"
+                )
+
+            # Calculate exposure
+            premium_per_contract = contract.ask
+            total_premium = contracts * premium_per_contract * 100
+
+            # Validate against buying power
+            if total_premium > buying_power:
+                contracts = int(buying_power / (premium_per_contract * 100))
+                if contracts <= 0:
+                    return OptionsPositionSize(
+                        contracts=0,
+                        premium_per_contract=0,
+                        total_premium=0,
+                        max_risk=0,
+                        delta_exposure=0,
+                        theta_per_day=0,
+                        valid=False,
+                        reason="Insufficient buying power"
+                    )
+                total_premium = contracts * premium_per_contract * 100
+
+            # Calculate Greeks exposure
+            if contract.greeks:
+                delta_exposure = contracts * 100 * abs(contract.greeks.delta)
+                theta_per_day = contracts * contract.greeks.theta
+            else:
+                delta_exposure = 0
+                theta_per_day = 0
+
+            # Calculate max risk
+            if is_debit:
+                max_risk = total_premium
+            elif spread_width:
+                max_risk = spread_width * 100 * contracts
+            else:
+                max_risk = contract.strike * 100 * contracts  # Worst case
+
+            logger.info(
+                f"Options position size for {contract.symbol}: {contracts} contracts @ ${premium_per_contract:.2f} = ${total_premium:.2f} "
+                f"(Delta exposure: {delta_exposure:.0f} shares, Max risk: ${max_risk:.2f})"
+            )
+
+            return OptionsPositionSize(
+                contracts=contracts,
+                premium_per_contract=premium_per_contract,
+                total_premium=total_premium,
+                max_risk=max_risk,
+                delta_exposure=delta_exposure,
+                theta_per_day=theta_per_day,
+                valid=True,
+                reason="OK"
+            )
+
+        except Exception as e:
+            logger.error(f"Error calculating options position size: {e}")
+            return OptionsPositionSize(
+                contracts=0,
+                premium_per_contract=0,
+                total_premium=0,
+                max_risk=0,
+                delta_exposure=0,
+                theta_per_day=0,
+                valid=False,
+                reason=str(e)
+            )
+
+    def validate_options_greeks(
+        self,
+        contracts: int,
+        contract: 'OptionContract'  # Forward reference
+    ) -> tuple[bool, str]:
+        """
+        Validate that options Greeks are within acceptable limits.
+
+        Args:
+            contracts: Number of contracts
+            contract: OptionContract object
+
+        Returns:
+            Tuple of (is_valid, reason)
+        """
+        if not contract.greeks:
+            return False, "Greeks not available"
+
+        # Check delta exposure
+        delta_exposure = contracts * 100 * abs(contract.greeks.delta)
+
+        try:
+            account = self.client.get_account()
+            max_delta_dollars = account.portfolio_value * settings.MAX_DELTA_EXPOSURE
+
+            if delta_exposure > max_delta_dollars:
+                return False, f"Delta exposure ${delta_exposure:.0f} exceeds max ${max_delta_dollars:.0f}"
+
+            # Check theta decay
+            theta_per_day = contracts * contract.greeks.theta
+            position_value = contracts * contract.ask * 100
+
+            if position_value > 0:
+                theta_ratio = abs(theta_per_day) / position_value
+                if theta_ratio > abs(settings.MIN_THETA_RATIO):
+                    return False, f"Theta decay {theta_ratio:.2%}/day exceeds limit {settings.MIN_THETA_RATIO:.2%}"
 
             return True, "OK"
 

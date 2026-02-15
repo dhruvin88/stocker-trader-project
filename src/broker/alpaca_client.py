@@ -1,6 +1,6 @@
 import time
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime, timedelta, date
+from typing import Optional, TYPE_CHECKING
 from dataclasses import dataclass
 
 import alpaca_trade_api as tradeapi
@@ -8,6 +8,15 @@ from alpaca_trade_api.rest import APIError, TimeFrame, TimeFrameUnit
 
 from config.settings import settings
 from src.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from src.broker.options_chain import OptionContract, OptionsChain
+
+# Import at runtime to avoid circular imports
+def _get_options_imports():
+    from src.broker.options_chain import OptionContract, OptionsChain
+    from src.risk.options_greeks import GreeksCalculator
+    return OptionContract, OptionsChain, GreeksCalculator
 
 logger = get_logger(__name__)
 
@@ -97,6 +106,9 @@ class AlpacaClient:
         )
         self._last_request_time = 0
         self._min_request_interval = 0.2  # 200ms between requests
+        self._options_chain_cache = {}  # Cache with (symbol, timestamp) key
+        self._options_cache_ttl = 900  # 15 minutes in seconds
+        self._greeks_calculator = None  # Lazy load to avoid circular import
 
     def _rate_limit(self):
         """Simple rate limiting."""
@@ -495,6 +507,276 @@ class AlpacaClient:
             start=start_date,
             end=end_date
         )
+
+    def get_options_chain(
+        self,
+        underlying: str,
+        expiration_start: Optional[date] = None,
+        expiration_end: Optional[date] = None,
+        use_cache: bool = True
+    ):  # Return type omitted to avoid circular import
+        """
+        Fetch options chain from Alpaca API.
+
+        Args:
+            underlying: Underlying symbol (e.g., "AAPL")
+            expiration_start: Optional start date filter
+            expiration_end: Optional end date filter
+            use_cache: Use cached data if available (default True)
+
+        Returns:
+            OptionsChain with contracts and Greeks
+        """
+        # Lazy load options classes
+        OptionContract, OptionsChain, GreeksCalculator = _get_options_imports()
+
+        if self._greeks_calculator is None:
+            self._greeks_calculator = GreeksCalculator()
+
+        # Check cache first
+        cache_key = (underlying, expiration_start, expiration_end)
+        if use_cache and cache_key in self._options_chain_cache:
+            cached_data, timestamp = self._options_chain_cache[cache_key]
+            if time.time() - timestamp < self._options_cache_ttl:
+                logger.debug(f"Using cached options chain for {underlying}")
+                return cached_data
+
+        # Get underlying price
+        quote = self.get_quote(underlying)
+        underlying_price = quote.last if quote.last > 0 else quote.bid
+
+        # Fetch options snapshots from Alpaca
+        # Note: Alpaca's options API endpoint is /v1beta1/options/snapshots/{underlying}
+        try:
+            # Build URL for options snapshots
+            url = f"/v1beta1/options/snapshots/{underlying}"
+            params = {}
+            if expiration_start:
+                params['expiration_date_gte'] = expiration_start.isoformat()
+            if expiration_end:
+                params['expiration_date_lte'] = expiration_end.isoformat()
+
+            # Make API request using the underlying REST client
+            response = self._retry_with_backoff(
+                lambda: self.api._request('GET', url, params=params)
+            )
+
+            # Parse response
+            contracts_dict = {}
+            expirations_set = set()
+
+            if 'snapshots' in response:
+                for contract_symbol, snapshot_data in response['snapshots'].items():
+                    contract = self._parse_option_contract(
+                        contract_symbol,
+                        underlying,
+                        underlying_price,
+                        snapshot_data
+                    )
+                    if contract:
+                        contracts_dict[contract_symbol] = contract
+                        expirations_set.add(contract.expiration)
+
+            expirations = sorted(list(expirations_set))
+
+            chain = OptionsChain(
+                underlying=underlying,
+                underlying_price=underlying_price,
+                expirations=expirations,
+                contracts=contracts_dict
+            )
+
+            # Update cache
+            self._options_chain_cache[cache_key] = (chain, time.time())
+
+            logger.info(
+                f"Fetched options chain for {underlying}: "
+                f"{len(contracts_dict)} contracts, {len(expirations)} expirations"
+            )
+
+            return chain
+
+        except APIError as e:
+            logger.error(f"Failed to fetch options chain for {underlying}: {e}")
+            # Return empty chain
+            return OptionsChain(
+                underlying=underlying,
+                underlying_price=underlying_price,
+                expirations=[],
+                contracts={}
+            )
+
+    def _parse_option_contract(
+        self,
+        contract_symbol: str,
+        underlying: str,
+        underlying_price: float,
+        snapshot_data: dict
+    ) -> Optional[OptionContract]:
+        """
+        Parse Alpaca option snapshot into OptionContract.
+
+        Args:
+            contract_symbol: Full OCC symbol
+            underlying: Underlying symbol
+            underlying_price: Current underlying price
+            snapshot_data: Snapshot data from Alpaca API
+
+        Returns:
+            OptionContract or None if parsing fails
+        """
+        try:
+            # Parse OCC symbol format: AAPL230120C00150000
+            # Format: [Underlying][YYMMDD][C/P][Strike*1000]
+            # Example: AAPL230120C00150000 = AAPL Jan 20 2023 $150 Call
+
+            # Extract components
+            symbol_without_underlying = contract_symbol[len(underlying):]
+
+            # Date is next 6 characters (YYMMDD)
+            date_str = symbol_without_underlying[:6]
+            exp_year = 2000 + int(date_str[:2])
+            exp_month = int(date_str[2:4])
+            exp_day = int(date_str[4:6])
+            expiration = date(exp_year, exp_month, exp_day)
+
+            # Option type (C or P)
+            option_type_char = symbol_without_underlying[6]
+            contract_type = 'call' if option_type_char == 'C' else 'put'
+
+            # Strike price (last 8 digits, divide by 1000)
+            strike_str = symbol_without_underlying[7:]
+            strike = int(strike_str) / 1000.0
+
+            # Extract pricing data
+            latest_quote = snapshot_data.get('latestQuote', {})
+            latest_trade = snapshot_data.get('latestTrade', {})
+            greeks_data = snapshot_data.get('greeks', {})
+            implied_vol = snapshot_data.get('impliedVolatility', 0)
+
+            bid = float(latest_quote.get('bp', 0)) if latest_quote else 0
+            ask = float(latest_quote.get('ap', 0)) if latest_quote else 0
+            last = float(latest_trade.get('p', 0)) if latest_trade else 0
+            volume = int(latest_trade.get('s', 0)) if latest_trade else 0
+            open_interest = int(snapshot_data.get('openInterest', 0))
+
+            # Calculate Greeks if not provided by API
+            if greeks_data:
+                from src.risk.options_greeks import OptionGreeks
+                greeks = OptionGreeks(
+                    delta=float(greeks_data.get('delta', 0)),
+                    gamma=float(greeks_data.get('gamma', 0)),
+                    theta=float(greeks_data.get('theta', 0)),
+                    vega=float(greeks_data.get('vega', 0)),
+                    rho=float(greeks_data.get('rho', 0)),
+                    iv=float(implied_vol)
+                )
+            else:
+                # Calculate Greeks using Black-Scholes
+                tte = self._greeks_calculator.time_to_expiry_years(expiration)
+                if implied_vol > 0:
+                    greeks = self._greeks_calculator.calculate_greeks(
+                        contract_type,
+                        underlying_price,
+                        strike,
+                        tte,
+                        implied_vol
+                    )
+                else:
+                    # Use default IV if not available
+                    greeks = self._greeks_calculator.calculate_greeks(
+                        contract_type,
+                        underlying_price,
+                        strike,
+                        tte,
+                        0.30  # Default 30% IV
+                    )
+
+            return OptionContract(
+                symbol=contract_symbol,
+                underlying=underlying,
+                contract_type=contract_type,
+                strike=strike,
+                expiration=expiration,
+                bid=bid,
+                ask=ask,
+                last=last,
+                volume=volume,
+                open_interest=open_interest,
+                implied_volatility=float(implied_vol) if implied_vol else greeks.iv,
+                greeks=greeks
+            )
+
+        except Exception as e:
+            logger.warning(f"Failed to parse option contract {contract_symbol}: {e}")
+            return None
+
+    def get_option_quote(self, contract_symbol: str):
+        """
+        Get real-time quote for specific option contract.
+
+        Args:
+            contract_symbol: Full OCC option symbol
+
+        Returns:
+            OptionContract with current pricing, or None if not found
+        """
+        try:
+            # Extract underlying from OCC symbol
+            # Find where the date starts (after underlying ticker)
+            underlying = None
+            for i in range(1, len(contract_symbol)):
+                if contract_symbol[i].isdigit():
+                    underlying = contract_symbol[:i]
+                    break
+
+            if not underlying:
+                logger.error(f"Could not parse underlying from {contract_symbol}")
+                return None
+
+            # Get full chain (will use cache if available)
+            chain = self.get_options_chain(underlying)
+
+            # Return specific contract
+            return chain.contracts.get(contract_symbol)
+
+        except Exception as e:
+            logger.error(f"Failed to get option quote for {contract_symbol}: {e}")
+            return None
+
+    def get_options_contracts(
+        self,
+        underlying: str,
+        strike: float,
+        expiration: date,
+        option_type: str
+    ) -> list[OptionContract]:
+        """
+        Filter options by specific criteria.
+
+        Args:
+            underlying: Underlying symbol
+            strike: Target strike price (will find closest)
+            expiration: Expiration date
+            option_type: 'call' or 'put'
+
+        Returns:
+            List of matching contracts (usually just one)
+        """
+        chain = self.get_options_chain(underlying)
+
+        # Filter by expiration and type
+        contracts = [
+            c for c in chain.contracts.values()
+            if c.expiration == expiration and c.contract_type == option_type
+        ]
+
+        if not contracts:
+            return []
+
+        # Find closest strike
+        closest = min(contracts, key=lambda c: abs(c.strike - strike))
+        return [closest]
 
 
 _client_instance: Optional[AlpacaClient] = None
