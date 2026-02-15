@@ -179,7 +179,7 @@ class AlpacaClient:
             p = self.api.get_position(api_symbol)
             return Position(
                 symbol=symbol,  # Return original format
-                qty=int(float(p.qty)),  # Crypto can have fractional qty
+                qty=float(p.qty),  # Keep as float for crypto fractional support
                 avg_entry_price=float(p.avg_entry_price),
                 current_price=float(p.current_price),
                 market_value=float(p.market_value),
@@ -264,10 +264,18 @@ class AlpacaClient:
         if crypto_symbols:
             for symbol in crypto_symbols:
                 try:
-                    snapshot = self._retry_with_backoff(
+                    snapshots = self._retry_with_backoff(
                         self.api.get_crypto_snapshot,
                         symbol
                     )
+                    # Access the snapshot for this symbol
+                    snapshot = snapshots[symbol] if symbol in snapshots else None
+
+                    if snapshot is None:
+                        quotes[symbol] = Quote(symbol=symbol, bid=0, ask=0, bid_size=0,
+                                             ask_size=0, last=0, timestamp=datetime.now())
+                        continue
+
                     quote = snapshot.latest_quote
                     trade = snapshot.latest_trade
                     quotes[symbol] = Quote(
@@ -287,7 +295,7 @@ class AlpacaClient:
     def submit_order(
         self,
         symbol: str,
-        qty: int,
+        qty: float,  # Float for crypto fractional support
         side: str,
         order_type: str = "limit",
         time_in_force: str = "day",

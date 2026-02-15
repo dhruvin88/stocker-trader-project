@@ -222,12 +222,15 @@ class OrderManager:
                 f"Executing exit: {exit_qty} {symbol} @ ${limit_price:.2f} (Reason: {reason})"
             )
 
+            # Crypto requires 'gtc' time_in_force, stocks use 'day'
+            is_crypto = settings.is_crypto_symbol(symbol)
             order = self.client.submit_order(
                 symbol=symbol,
                 qty=exit_qty,
                 side=side,
                 order_type="limit",
-                limit_price=limit_price
+                limit_price=limit_price,
+                time_in_force="gtc" if is_crypto else "day"
             )
 
             result = self._wait_for_fill(order.id, settings.ORDER_TIMEOUT_SECONDS)

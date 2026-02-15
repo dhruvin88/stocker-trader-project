@@ -30,7 +30,7 @@ class StopCheck:
     reason: Optional[ExitReason]
     exit_price: Optional[float]
     partial_exit: bool
-    exit_quantity: Optional[int]
+    exit_quantity: Optional[float]  # Float for crypto fractional support
 
 
 class StopManager:
@@ -118,7 +118,11 @@ class StopManager:
         if take_profit:
             if is_long and current_price >= take_profit:
                 logger.info(f"{symbol}: Take profit triggered at ${current_price:.2f}")
-                exit_qty = max(1, abs(quantity) // 2)
+                # Use float division for crypto fractional support
+                exit_qty = abs(quantity) / 2
+                # For stocks, round to at least 1 share
+                if not settings.is_crypto_symbol(symbol):
+                    exit_qty = max(1, int(exit_qty))
                 return StopCheck(
                     should_exit=True,
                     reason=ExitReason.TAKE_PROFIT,
@@ -128,7 +132,11 @@ class StopManager:
                 )
             elif not is_long and current_price <= take_profit:
                 logger.info(f"{symbol}: Take profit triggered at ${current_price:.2f}")
-                exit_qty = max(1, abs(quantity) // 2)
+                # Use float division for crypto fractional support
+                exit_qty = abs(quantity) / 2
+                # For stocks, round to at least 1 share
+                if not settings.is_crypto_symbol(symbol):
+                    exit_qty = max(1, int(exit_qty))
                 return StopCheck(
                     should_exit=True,
                     reason=ExitReason.TAKE_PROFIT,
