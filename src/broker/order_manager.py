@@ -261,22 +261,26 @@ class OrderManager:
                     pnl = -pnl
                 pnl_percent = (pnl / (entry_price * exit_qty)) * 100
 
-                db_position = self.db.get_position(symbol)
-                if db_position:
-                    trades = self.db.get_trades_by_date_range(
-                        datetime.now().date(),
-                        datetime.now().date()
+                # Update trade record in database - search ALL open trades, not just today
+                # This fixes the issue where bracket orders close positions days after entry
+                open_trades = self.db.get_open_trades()
+                for trade in open_trades:
+                    if trade.symbol == symbol:
+                        self.db.update_trade_exit(
+                            trade_id=trade.id,
+                            exit_time=datetime.now(),
+                            exit_price=result.filled_price,
+                            pnl=pnl,
+                            pnl_percent=pnl_percent
+                        )
+                        logger.info(f"Updated trade record {trade.id} for {symbol} exit")
+                        break
+                else:
+                    # No open trade found - log warning but continue
+                    logger.warning(
+                        f"No open trade found in database for {symbol} exit. "
+                        f"P&L: ${pnl:.2f} ({pnl_percent:+.2f}%) will not be tracked."
                     )
-                    for trade in trades:
-                        if trade.symbol == symbol and trade.exit_time is None:
-                            self.db.update_trade_exit(
-                                trade_id=trade.id,
-                                exit_time=datetime.now(),
-                                exit_price=result.filled_price,
-                                pnl=pnl,
-                                pnl_percent=pnl_percent
-                            )
-                            break
 
                 if exit_qty >= abs(position.qty):
                     self.db.remove_position(symbol)
