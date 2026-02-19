@@ -223,8 +223,21 @@ class AlpacaClient:
                 return Quote(symbol=symbol, bid=0, ask=0, bid_size=0,
                            ask_size=0, last=0, timestamp=datetime.now())
 
-            quote = snapshot.latest_quote
-            trade = snapshot.latest_trade
+            # Try to access quote and trade data with fallbacks
+            quote = getattr(snapshot, 'latest_quote', None) or getattr(snapshot, 'quote', None)
+            trade = getattr(snapshot, 'latest_trade', None) or getattr(snapshot, 'trade', None)
+
+            # If no quote/trade attributes, check if snapshot itself has the data
+            if quote is None and hasattr(snapshot, 'bp'):
+                return Quote(
+                    symbol=symbol,
+                    bid=float(snapshot.bp) if hasattr(snapshot, 'bp') else 0,
+                    ask=float(snapshot.ap) if hasattr(snapshot, 'ap') else 0,
+                    bid_size=int(snapshot.bs) if hasattr(snapshot, 'bs') else 0,
+                    ask_size=int(snapshot.as_) if hasattr(snapshot, 'as_') else 0,
+                    last=float(snapshot.p) if hasattr(snapshot, 'p') else 0,
+                    timestamp=datetime.now()
+                )
         else:
             snapshot = self._retry_with_backoff(
                 self.api.get_snapshot,
@@ -288,17 +301,36 @@ class AlpacaClient:
                                              ask_size=0, last=0, timestamp=datetime.now())
                         continue
 
-                    quote = snapshot.latest_quote
-                    trade = snapshot.latest_trade
-                    quotes[symbol] = Quote(
-                        symbol=symbol,
-                        bid=float(quote.bp) if quote else 0,
-                        ask=float(quote.ap) if quote else 0,
-                        bid_size=int(quote.bs) if quote and hasattr(quote, 'bs') else 0,
-                        ask_size=int(quote.as_) if quote and hasattr(quote, 'as_') else 0,
-                        last=float(trade.p) if trade else 0,
-                        timestamp=datetime.now()
-                    )
+                    # Try to access quote and trade data with fallbacks
+                    quote = getattr(snapshot, 'latest_quote', None) or getattr(snapshot, 'quote', None)
+                    trade = getattr(snapshot, 'latest_trade', None) or getattr(snapshot, 'trade', None)
+
+                    # If still no data, use snapshot direct attributes as fallback
+                    if quote is None and hasattr(snapshot, 'bp'):
+                        # Snapshot itself has quote data
+                        quotes[symbol] = Quote(
+                            symbol=symbol,
+                            bid=float(snapshot.bp) if hasattr(snapshot, 'bp') else 0,
+                            ask=float(snapshot.ap) if hasattr(snapshot, 'ap') else 0,
+                            bid_size=int(snapshot.bs) if hasattr(snapshot, 'bs') else 0,
+                            ask_size=int(snapshot.as_) if hasattr(snapshot, 'as_') else 0,
+                            last=float(snapshot.p) if hasattr(snapshot, 'p') else 0,
+                            timestamp=datetime.now()
+                        )
+                    elif quote or trade:
+                        quotes[symbol] = Quote(
+                            symbol=symbol,
+                            bid=float(quote.bp) if quote and hasattr(quote, 'bp') else 0,
+                            ask=float(quote.ap) if quote and hasattr(quote, 'ap') else 0,
+                            bid_size=int(quote.bs) if quote and hasattr(quote, 'bs') else 0,
+                            ask_size=int(quote.as_) if quote and hasattr(quote, 'as_') else 0,
+                            last=float(trade.p) if trade and hasattr(trade, 'p') else 0,
+                            timestamp=datetime.now()
+                        )
+                    else:
+                        # No data available
+                        quotes[symbol] = Quote(symbol=symbol, bid=0, ask=0, bid_size=0,
+                                             ask_size=0, last=0, timestamp=datetime.now())
                 except Exception as e:
                     logger.warning(f"Failed to get crypto quote for {symbol}: {e}")
 

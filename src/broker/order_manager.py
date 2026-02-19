@@ -212,14 +212,14 @@ class OrderManager:
         """
         try:
             position = self.client.get_position(symbol)
-            if position is None:
-                # Position doesn't exist at broker - clean up local DB if present
+            if position is None or abs(position.qty) == 0:
+                # Position doesn't exist at broker or has zero quantity - clean up local DB if present
                 # This can happen when bracket orders execute stop/take-profit
                 db_position = self.db.get_position(symbol)
                 if db_position:
                     logger.warning(
-                        f"Position {symbol} not found at broker but exists in local DB. "
-                        f"Cleaning up stale position (likely closed by bracket order)."
+                        f"Position {symbol} not found at broker (qty={position.qty if position else 'None'}) "
+                        f"but exists in local DB. Cleaning up stale position (likely closed by bracket order)."
                     )
                     self.db.remove_position(symbol)
                 return OrderResult(
@@ -228,7 +228,7 @@ class OrderManager:
                     status=OrderStatus.FAILED,
                     filled_qty=0,
                     filled_price=None,
-                    message=f"No position found for {symbol}"
+                    message=f"No position found for {symbol} or quantity is zero"
                 )
 
             exit_qty = quantity or abs(position.qty)
