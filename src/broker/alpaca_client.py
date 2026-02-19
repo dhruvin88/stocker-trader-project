@@ -580,17 +580,20 @@ class AlpacaClient:
         # Fetch options snapshots from Alpaca
         # Note: Alpaca's options API endpoint is /v1beta1/options/snapshots/{underlying}
         try:
-            # Build URL for options snapshots
+            # Build URL with query parameters
             url = f"/v1beta1/options/snapshots/{underlying}"
-            params = {}
+            query_params = []
             if expiration_start:
-                params['expiration_date_gte'] = expiration_start.isoformat()
+                query_params.append(f"expiration_date_gte={expiration_start.isoformat()}")
             if expiration_end:
-                params['expiration_date_lte'] = expiration_end.isoformat()
+                query_params.append(f"expiration_date_lte={expiration_end.isoformat()}")
+
+            if query_params:
+                url += "?" + "&".join(query_params)
 
             # Make API request using the underlying REST client
             response = self._retry_with_backoff(
-                lambda: self.api._request('GET', url, params=params)
+                lambda: self.api._request('GET', url)
             )
 
             # Parse response
